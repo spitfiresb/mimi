@@ -15,7 +15,6 @@ final class HotkeyMonitor {
     private static let spaceKeyCode: Int64 = 49
 
     private var tap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
     private var isDown = false
 
     func start() -> Bool {
@@ -42,7 +41,6 @@ final class HotkeyMonitor {
 
         self.tap = tap
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         return true

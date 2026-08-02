@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let engine = SpeechEngine()
     private let audio = AudioCapture()
     private let hotkey = HotkeyMonitor()
+    private let overlay = OverlayPanel()
 
     private var session: TranscriptionSession?
     private var isRecording = false
@@ -86,15 +87,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isRecording else { return }
         isRecording = true
         setState(symbol: "mic.fill", status: "Listening…")
+        overlay.show("Listening…")
 
         do {
             let (session, format) = try await engine.makeSession()
             let stream = try audio.start(outputFormat: format)
-            try await session.start(stream)
+            try await session.start(stream) { [weak self] text in
+                Task { @MainActor in
+                    guard let self, self.isRecording else { return }
+                    self.overlay.update(text.isEmpty ? "Listening…" : text)
+                }
+            }
             self.session = session
         } catch {
             isRecording = false
             audio.stop()
+            overlay.hide()
             setState(symbol: "mic", status: "Error: \(error.localizedDescription)")
         }
     }
@@ -104,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isRecording = false
         self.session = nil
         setState(symbol: "mic", status: "Transcribing…")
+        overlay.update("Transcribing…")
 
         // Finishing the audio stream is what lets finalize() return.
         audio.stop()
@@ -111,11 +120,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let text = try await session.finish()
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // Hide before pasting so the overlay is never in the way.
+            overlay.hide()
+
             if !trimmed.isEmpty {
                 await TextInserter.insert(trimmed)
             }
             setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
         } catch {
+            overlay.hide()
             setState(symbol: "mic", status: "Error: \(error.localizedDescription)")
         }
     }
