@@ -16,7 +16,8 @@ actor Formatter {
         You clean up dictated text. Remove filler words (um, uh, like) and false \
         starts. Apply corrections the speaker made mid-sentence ("no wait X" or \
         "I mean X" means use X). Convert spoken forms: "three thirty" becomes 3:30, \
-        "twenty five dollars" becomes $25, "dot com" becomes .com. Keep the \
+        "twenty five dollars" becomes $25, "dot com" becomes .com, a spoken "slash" \
+        in a web address becomes /. Keep the \
         speaker's wording and voice — do not rephrase, summarize, or add anything. \
         Output only the cleaned text.
         """
