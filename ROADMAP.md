@@ -122,7 +122,9 @@ there's a week of log data rather than three lines.
 - [x] Toggle to disable ("Clean Up Dictation" in the menu), for when you want verbatim
 - [x] Skip the pass on very short utterances (< 3 words)
 - [x] Prewarm at bootstrap — cold ~3s, warm ~0.5–0.7s (measured 2026-08-03, M-series)
-- [ ] Feed confidence + alternatives into the prompt (needs the richer transcriber init)
+- [x] Richer transcriber init: n-best alternatives + per-run confidence now collected and logged per dictation *(2026-08-03 — measure first: does confidence flag the real errors?)*
+- [x] `contextualStrings` wired: vocabulary.txt (one term per line) read per session, pushed via `setContext` — open question #1 is now an A/B you can run by editing a text file
+- [ ] Feed confidence + alternatives into the formatting prompt (build only if the log shows confidence flags real errors)
 - [ ] Tune the prompt against a week of real log data — n is still tiny
 - [ ] Latency: ~0.5–0.7s added per dictation. Acceptable? Watch it in real use.
 

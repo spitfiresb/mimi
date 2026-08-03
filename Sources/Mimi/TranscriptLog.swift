@@ -21,11 +21,32 @@ struct TranscriptEntry: Codable {
     /// What the ASR produced, verbatim.
     var raw: String
 
+    /// Per-result recognition detail: confidence spans and the n-best
+    /// alternatives the recognizer considered. Collected to answer one question —
+    /// when it's wrong, did it know, and was the right word in the list?
+    var recognition: [RecognitionResult]?
+
     /// What the formatting pass produced.
     var formatted: String?
 
     /// What the text looked like after the user fixed it. The label.
     var corrected: String?
+}
+
+/// One final result from the recognizer, with what it almost said instead.
+struct RecognitionResult: Codable {
+    /// The text it committed to.
+    var text: String
+    /// Runner-up transcriptions, best first.
+    var alts: [String]
+    /// Confidence runs over `text`: `t` is the substring, `c` its 0–1 confidence
+    /// (absent where the recognizer didn't attach one).
+    var spans: [Span]
+
+    struct Span: Codable {
+        var t: String
+        var c: Double?
+    }
 }
 
 /// Append-only local log of every dictation, as JSONL.

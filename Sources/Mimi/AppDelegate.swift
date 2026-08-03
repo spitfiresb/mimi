@@ -223,7 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         audio.stop()
 
         do {
-            let text = try await session.finish()
+            let (text, recognition) = try await session.finish()
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
             // Hide before pasting so the overlay is never in the way.
@@ -233,7 +233,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let formattingOn = !UserDefaults.standard.bool(forKey: Self.verbatimKey)
                 let output = formattingOn ? await formatter.format(trimmed) : trimmed
                 await TextInserter.insert(output)
-                await log(trimmed, formatted: output == trimmed ? nil : output, context: context)
+                await log(
+                    trimmed,
+                    formatted: output == trimmed ? nil : output,
+                    recognition: recognition,
+                    context: context
+                )
             }
             setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
         } catch {
@@ -244,7 +249,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Logging
 
-    private func log(_ raw: String, formatted: String?, context: RecordingContext?) async {
+    private func log(
+        _ raw: String,
+        formatted: String?,
+        recognition: [RecognitionResult],
+        context: RecordingContext?
+    ) async {
         let elapsed = context.map { ContinuousClock.now - $0.startedAt } ?? .zero
         let entry = TranscriptEntry(
             durationMs: Int(elapsed / .milliseconds(1)),
@@ -252,6 +262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appBundleID: context?.appBundleID,
             appName: context?.appName,
             raw: raw,
+            recognition: recognition.isEmpty ? nil : recognition,
             formatted: formatted
         )
         await TranscriptLog.shared.append(entry)
