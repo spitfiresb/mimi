@@ -16,7 +16,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let overlay = OverlayPanel()
     private let formatter = Formatter()
 
-    private var session: TranscriptionSession?
+    /// Session startup is async; the user can release the key before it lands.
+    /// endRecording awaits this task instead of reading a `session` var that may
+    /// not be populated yet — the old shape dropped the utterance and left the
+    /// overlay stranded on screen.
+    private var startTask: Task<TranscriptionSession?, Never>?
     private var isRecording = false
 
     /// Captured when recording starts, so the log records where the text was
@@ -174,31 +178,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setState(symbol: "mic.fill", status: "Listening…")
         overlay.show("Listening…")
 
-        do {
-            let (session, _) = try await engine.makeSession()
-            let stream = audio.start()
-            try await session.start(stream) { [weak self] text in
-                Task { @MainActor in
-                    guard let self, self.isRecording else { return }
-                    self.overlay.update(text.isEmpty ? "Listening…" : text)
+        // Capture audio from the first instant; the stream buffers while the
+        // session spins up.
+        let stream = audio.start()
+
+        startTask = Task { [weak self] in
+            guard let self else { return nil }
+            do {
+                let (session, _) = try await engine.makeSession()
+                try await session.start(stream) { [weak self] text in
+                    Task { @MainActor in
+                        guard let self, self.isRecording else { return }
+                        self.overlay.update(text.isEmpty ? "Listening…" : text)
+                    }
                 }
+                return session
+            } catch {
+                setState(symbol: "mic", status: "Error: \(error.localizedDescription)")
+                return nil
             }
-            self.session = session
-        } catch {
-            isRecording = false
-            context = nil
-            audio.stop()
-            overlay.hide()
-            setState(symbol: "mic", status: "Error: \(error.localizedDescription)")
         }
     }
 
     private func endRecording() async {
-        guard isRecording, let session else { return }
+        guard isRecording else { return }
         isRecording = false
-        self.session = nil
         let context = self.context
         self.context = nil
+
+        // Wait for startup to land — however brief the press was, there may be
+        // buffered audio worth transcribing.
+        let session = await startTask?.value
+        startTask = nil
+
+        guard let session else {
+            audio.stop()
+            overlay.hide()
+            return
+        }
         setState(symbol: "mic", status: "Transcribing…")
         overlay.update("Transcribing…")
 

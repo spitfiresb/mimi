@@ -203,7 +203,7 @@ Deliberately late. Stage 0 works on the happy path; this makes it work every tim
 None of it improves a single word of output, which is why it waits — but all of it
 blocks shipping to anyone else.
 
-- [ ] Fix the press/release race — releasing the key before the session finishes starting drops the utterance
+- [x] Fix the press/release race — releasing the key before the session finishes starting dropped the utterance and stranded the overlay *(pulled forward 2026-08-03: hit in real use within an hour of the pull-forward rule being written)*
 - [ ] Handle input device switching, Bluetooth, sample rate changes
 - [ ] Insertion fallback chain: ⌘V → AX direct set → leave on clipboard and notify
 - [ ] Configurable hotkey instead of hardcoded ⌃⌥Space
