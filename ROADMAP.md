@@ -105,7 +105,15 @@ one asset here a competitor can't clone.
 
 ### Stage 2 — The formatting layer
 
-Where the actual product is. ASR gives you a lowercase unpunctuated run-on; this makes it into what you meant to type.
+Where the actual product is. Takes the transcript and makes it into what you meant to type.
+
+**Early signal (2026-08-03, n=3 — confirm with real volume):** the premise this
+stage was written on is partly wrong. `SpeechTranscriber` already punctuates and
+capitalizes — the first logged utterances came out as *"Okay, so the current system
+seems to be live now. I'm going to start using it pretty much for everything."* Not a
+lowercase run-on. So punctuation and casing may be mostly free, and the real remaining
+value is disfluency removal, reconstruction, and ITN. Re-scope this stage once
+there's a week of log data rather than three lines.
 
 - [ ] Foundation Models pass over raw transcript
 - [ ] Disfluency removal (um, uh, like, false starts)
