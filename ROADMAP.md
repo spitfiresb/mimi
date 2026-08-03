@@ -46,6 +46,7 @@ Dates are when the work landed on `main`.
 | 2026-08-02 | Live transcription overlay — a floating non-activating panel showing text as you speak (pulled forward from the wishlist) |
 | 2026-08-03 | **Stage 1 begins — transcript logging.** Every dictation appended locally as JSONL. Reordered the roadmap: output quality ahead of ergonomics |
 | 2026-08-03 | Launch at login via `SMAppService`, on by default — the app has to be running to log anything |
+| 2026-08-03 | **Stage 2 first cut — the formatting layer is live.** Foundation Models pass with invention-ratio guard, verbatim toggle, prewarm. Disfluencies, ITN, and reconstruction all working in first tests |
 
 **Current state: MVP.** The core loop works end to end and is genuinely usable.
 Collecting data; formatting layer is next.
@@ -115,15 +116,15 @@ lowercase run-on. So punctuation and casing may be mostly free, and the real rem
 value is disfluency removal, reconstruction, and ITN. Re-scope this stage once
 there's a week of log data rather than three lines.
 
-- [ ] Foundation Models pass over raw transcript
-- [ ] Disfluency removal (um, uh, like, false starts)
-- [ ] Punctuation + casing
-- [ ] Inverse text normalization — "three thirty" → 3:30, "twenty five dollars" → $25, "dot com" → .com
-- [ ] Proper noun casing
-- [ ] Sentence reconstruction — *"send it to Bob, no wait, Sarah"* → *"Send it to Sarah."*
-- [ ] **Over-edit guard** — reject output that diverges too far from source. An invented word the user can't detect is worse than a transcription error.
-- [ ] Toggle to disable, for when you want verbatim
-- [ ] Skip the pass on very short utterances (latency not worth it)
+- [x] Foundation Models pass over raw transcript *(2026-08-03)*
+- [x] Disfluency removal, ITN, sentence reconstruction — all handled by one prompt; the warm-up test got *"um so basically I think we should uh push the release to like thursday no wait friday"* → *"We should push the release to Friday."* and *"three thirty"* → *"3:30"* unprompted
+- [x] **Over-edit guard** — invention ratio, not edit distance: deletions are the job, invented words are the failure. >40% of output words absent from the raw → discard the rewrite, insert raw
+- [x] Toggle to disable ("Clean Up Dictation" in the menu), for when you want verbatim
+- [x] Skip the pass on very short utterances (< 3 words)
+- [x] Prewarm at bootstrap — cold ~3s, warm ~0.5–0.7s (measured 2026-08-03, M-series)
+- [ ] Feed confidence + alternatives into the prompt (needs the richer transcriber init)
+- [ ] Tune the prompt against a week of real log data — n is still tiny
+- [ ] Latency: ~0.5–0.7s added per dictation. Acceptable? Watch it in real use.
 
 #### Approach: one model pass, one mechanical guard — not a rulebook
 

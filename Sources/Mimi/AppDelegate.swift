@@ -6,10 +6,15 @@ import Speech
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var launchAtLoginItem: NSMenuItem?
+    private var formattingItem: NSMenuItem?
+
+    /// Stored inverted so formatting defaults to on without a registration dance.
+    private static let verbatimKey = "verbatimMode"
     private let engine = SpeechEngine()
     private let audio = AudioCapture()
     private let hotkey = HotkeyMonitor()
     private let overlay = OverlayPanel()
+    private let formatter = Formatter()
 
     private var session: TranscriptionSession?
     private var isRecording = false
@@ -53,6 +58,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hint.isEnabled = false
         menu.addItem(hint)
         menu.addItem(.separator())
+
+        let formatting = NSMenuItem(
+            title: "Clean Up Dictation",
+            action: #selector(toggleFormatting),
+            keyEquivalent: ""
+        )
+        formatting.target = self
+        menu.addItem(formatting)
+        self.formattingItem = formatting
 
         let launchAtLogin = NSMenuItem(
             title: "Open at Login",
@@ -125,6 +139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        // Warm the formatter alongside the transcriber; cold start is ~3s,
+        // warm is ~0.5s. Fire-and-forget — dictation must not wait on it.
+        Task { await formatter.prewarm() }
+
         hotkey.onPress = { [weak self] in Task { @MainActor in await self?.beginRecording() } }
         hotkey.onRelease = { [weak self] in Task { @MainActor in await self?.endRecording() } }
 
@@ -191,8 +209,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             overlay.hide()
 
             if !trimmed.isEmpty {
-                await TextInserter.insert(trimmed)
-                await log(trimmed, context: context)
+                let formattingOn = !UserDefaults.standard.bool(forKey: Self.verbatimKey)
+                let output = formattingOn ? await formatter.format(trimmed) : trimmed
+                await TextInserter.insert(output)
+                await log(trimmed, formatted: output == trimmed ? nil : output, context: context)
             }
             setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
         } catch {
@@ -203,14 +223,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Logging
 
-    private func log(_ raw: String, context: RecordingContext?) async {
+    private func log(_ raw: String, formatted: String?, context: RecordingContext?) async {
         let elapsed = context.map { ContinuousClock.now - $0.startedAt } ?? .zero
         let entry = TranscriptEntry(
             durationMs: Int(elapsed / .milliseconds(1)),
             locale: await engine.locale?.identifier,
             appBundleID: context?.appBundleID,
             appName: context?.appName,
-            raw: raw
+            raw: raw,
+            formatted: formatted
         )
         await TranscriptLog.shared.append(entry)
     }
@@ -229,6 +250,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// the real state each time the menu opens rather than trusting a cached flag.
     func menuNeedsUpdate(_ menu: NSMenu) {
         refreshLaunchAtLoginState()
+        formattingItem?.state = UserDefaults.standard.bool(forKey: Self.verbatimKey) ? .off : .on
+    }
+
+    @objc private func toggleFormatting() {
+        let defaults = UserDefaults.standard
+        defaults.set(!defaults.bool(forKey: Self.verbatimKey), forKey: Self.verbatimKey)
     }
 
     // MARK: - Actions
