@@ -11,8 +11,11 @@ APP="build/Mimi.app"
 swift build -c "$CONFIG"
 BIN="$(swift build -c "$CONFIG" --show-bin-path)/Mimi"
 
-# Quit a running copy so we can overwrite it.
-pkill -x Mimi 2>/dev/null || true
+# Quit a running copy so we can overwrite it. Note whether one was actually up,
+# so we can put it back afterwards — a dead menu bar app looks identical to a
+# broken hotkey, and that's a confusing half hour.
+WAS_RUNNING=0
+pkill -x Mimi 2>/dev/null && WAS_RUNNING=1 || true
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -32,6 +35,15 @@ if [ "${RESET_TCC:-1}" = "1" ]; then
 fi
 
 echo "built $APP"
+
+# Relaunch if it was running before. Set RELAUNCH=0 to skip.
+if [ "$WAS_RUNNING" = "1" ] && [ "${RELAUNCH:-1}" = "1" ]; then
+	open "$APP"
+	echo "relaunched Mimi"
+fi
+
 echo
-echo "Next: launch it, then System Settings > Privacy & Security > Accessibility"
-echo "      and switch Mimi on. The toggle will be off and unchecked."
+echo "Next: System Settings > Privacy & Security > Accessibility and switch Mimi on."
+echo "      The toggle will be off and unchecked — the reset above cleared it."
+echo "      Until it's on, the hotkey does nothing and the menu bar reads"
+echo "      \"Waiting for Accessibility permission…\"."
