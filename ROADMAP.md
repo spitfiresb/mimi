@@ -125,6 +125,45 @@ there's a week of log data rather than three lines.
 - [ ] Toggle to disable, for when you want verbatim
 - [ ] Skip the pass on very short utterances (latency not worth it)
 
+#### Approach: one model pass, one mechanical guard — not a rulebook
+
+Rules don't scale here. ITN alone is thousands of cases, every rule is a rule you
+maintain forever, and no rule reconstructs *"send it to Bob, no wait, Sarah."* But the
+inverse — trusting a 3B model with free rein over your text — is how you get invented
+words. The split: **the model makes judgments, deterministic code enforces safety.**
+
+**Feed it acoustic uncertainty, not just text.** Verified in the macOS 26.5 SDK,
+`SpeechTranscriber.init(locale:transcriptionOptions:reportingOptions:attributeOptions:)`
+opts into more than the presets expose:
+
+| Option | Gives |
+|---|---|
+| `.alternativeTranscriptions` | `Result.alternatives: [AttributedString]` — n-best |
+| `.transcriptionConfidence` | per-run `Double` confidence |
+| `.audioTimeRange` | per-run timing, so pauses are visible |
+
+That's the acoustically-derived information a text-only model would otherwise lose —
+without touching the audio or bundling a multimodal model.
+
+**Gate edits on confidence.** High-confidence spans are locked; the model may only
+rewrite what the recognizer was unsure of. This makes hallucination *structurally*
+hard rather than prompt-hard, which is the only kind of hard that survives contact
+with a small model.
+
+**Guard mechanically.** Token-level edit distance between raw and output; past a
+threshold, discard the rewrite and insert the raw text. One deterministic rule, not a
+rulebook.
+
+**Apple Foundation Models is the engine.** `FoundationModels.framework` ships in the
+26.5 SDK: `LanguageModelSession.respond(to:generating:)` with `@Generable` gives
+schema-constrained decoding, so the output shape is guaranteed rather than parsed.
+Zero bundled weights, which keeps the size principle intact.
+
+**It is text-only.** No audio or image input anywhere in the API surface. True
+audio→LLM would mean a third-party multimodal model via MLX — gigabytes of weights,
+which breaks the second principle outright. Revisit only if the confidence-and-
+alternatives channel proves insufficient.
+
 **Done when:** the output reads like something you typed, not something you dictated.
 
 **Watch:** this adds ~200–500ms. Budget it.
@@ -225,7 +264,7 @@ Unscheduled. Pull forward if something proves important.
 
 ## Open questions
 
-1. **Does `SpeechTranscriber` honor custom vocabulary?** Partly resolved by reading the SDK: `contextualStrings` lives on `AnalysisContext`, which `SpeechAnalyzer.init(…analysisContext:)` accepts for *any* module — so it is **not** restricted to `DictationTranscriber` as the docs imply. The API path is open. Whether `SpeechTranscriber` actually acts on it is still an empirical test, and it gates Stage 4's biasing work. Cheap to answer — worth doing early, because a "no" changes how personalization reaches the ASR layer at all.
+1. **Does `SpeechTranscriber` honor custom vocabulary?** Partly resolved by reading the SDK: `contextualStrings` lives on `AnalysisContext`, which `SpeechAnalyzer.init(…analysisContext:)` accepts for *any* module — so it is **not** restricted to `DictationTranscriber` as the docs imply. The API path is open. Whether `SpeechTranscriber` actually acts on it is still an empirical test, and it gates Stage 4's biasing work. Cheap to answer — worth doing early, because a "no" changes how personalization reaches the ASR layer at all. Further confirmed in the 26.5 SDK: `contextualStrings` is keyed by a `ContextualStringsTag` (`.general` provided), and `SpeechAnalyzer.setContext(_:)` updates it *mid-session* — so learned vocabulary can be pushed in without tearing down the analyzer. The plumbing is better than expected; only the behaviour is unproven.
 2. **How much latency will users tolerate** for the formatting pass before wanting it off?
 3. **What's the right correction-detection window** in Stage 1 before edits stop being "corrections" and start being ordinary editing?
 
