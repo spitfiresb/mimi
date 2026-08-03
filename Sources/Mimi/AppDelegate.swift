@@ -134,6 +134,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try await engine.prepare { message in
                 Task { @MainActor in self.setState(symbol: "mic", status: message) }
             }
+            // Mic goes hot now and stays hot — starting it at keypress loses the
+            // first second of speech to hardware spin-up.
+            guard let format = await engine.analyzerFormat else { throw MimiError.notPrepared }
+            try audio.prepare(outputFormat: format)
         } catch {
             setState(symbol: "mic.slash", status: "Error: \(error.localizedDescription)")
             return
@@ -171,8 +175,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         overlay.show("Listening…")
 
         do {
-            let (session, format) = try await engine.makeSession()
-            let stream = try audio.start(outputFormat: format)
+            let (session, _) = try await engine.makeSession()
+            let stream = audio.start()
             try await session.start(stream) { [weak self] text in
                 Task { @MainActor in
                     guard let self, self.isRecording else { return }
