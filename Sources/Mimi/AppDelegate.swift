@@ -312,9 +312,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.pipeline = nil
                 let formatMs = lap()
 
-                // Let the cleaned sentence land on screen before it lands in the
-                // document, then get out of the way and paste.
-                await overlay.settle(output)
+                // Let the cleaned sentence land on screen before it lands in
+                // the document — but only when cleanup changed something;
+                // there's nothing to reveal about text the user already watched
+                // arrive verbatim.
+                if output != trimmed {
+                    await overlay.settle(output)
+                }
                 overlay.hide()
                 let settleMs = lap()
                 await TextInserter.insert(output)

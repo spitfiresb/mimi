@@ -76,10 +76,25 @@ actor Formatter {
         ready = true
     }
 
+    /// One conversation per utterance: fresh enough that history never
+    /// accumulates across dictations (the all-day slowdown), long-lived enough
+    /// that sentences after the first reuse the processed instruction prefix.
+    /// Prewarm it at keypress and the instruction cost is paid while the user
+    /// is still speaking.
+    static func makeUtteranceSession() -> LanguageModelSession {
+        let session = LanguageModelSession(instructions: instructions)
+        session.prewarm()
+        return session
+    }
+
     /// One sentence: routed, cleaned under guided decoding, guarded. Returns the
     /// original whenever anything argues for leaving it alone. Leading
     /// whitespace is preserved so sentences reassemble cleanly.
-    func cleanSentence(_ sentence: String, suspectTokens: Set<String>) async -> String {
+    func cleanSentence(
+        _ sentence: String,
+        suspectTokens: Set<String>,
+        session: LanguageModelSession
+    ) async -> String {
         guard ready, Self.needsCleaning(sentence, suspectTokens: suspectTokens) else {
             return sentence
         }
@@ -87,9 +102,6 @@ actor Formatter {
         let lead = String(sentence.prefix(while: \.isWhitespace))
         let trimmed = sentence.trimmingCharacters(in: .whitespaces)
 
-        // Sessions are stateful — a reused one re-reads its whole history before
-        // every reply. Fresh session, empty conversation; the model stays loaded.
-        let session = LanguageModelSession(instructions: Self.instructions)
         do {
             let cleaned = try await session.respond(to: trimmed, generating: Cleaned.self)
                 .content.text
@@ -162,6 +174,10 @@ actor FormatPipeline {
     private let formatter: Formatter
     private let onProgress: @Sendable (String) -> Void
 
+    /// Created (and prewarmed) at keypress, shared by every sentence in this
+    /// utterance, discarded with the pipeline.
+    private let session = Formatter.makeUtteranceSession()
+
     private var suspect: Set<String> = []
     private var pending = ""
     private var output = ""
@@ -206,7 +222,9 @@ actor FormatPipeline {
         processing = Task {
             await previous?.value
             for sentence in sentences {
-                let cleaned = await formatter.cleanSentence(sentence, suspectTokens: suspectSnapshot)
+                let cleaned = await formatter.cleanSentence(
+                    sentence, suspectTokens: suspectSnapshot, session: session
+                )
                 append(cleaned)
             }
         }
