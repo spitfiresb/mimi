@@ -239,9 +239,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         audio.stop()
 
         do {
+            let clock = ContinuousClock()
+            var stamp = clock.now
+            func lap() -> Int {
+                let now = clock.now
+                defer { stamp = now }
+                return Int((now - stamp) / .milliseconds(1))
+            }
+
             let (text, recognition) = try await Self.withTimeout(seconds: 10) {
                 try await session.finish()
             }
+            let finalizeMs = lap()
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
             if trimmed.isEmpty {
@@ -249,16 +258,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 let formattingOn = !UserDefaults.standard.bool(forKey: Self.verbatimKey)
                 let output = formattingOn ? await formatter.format(trimmed) : trimmed
+                let formatMs = lap()
 
                 // Let the cleaned sentence land on screen before it lands in the
                 // document, then get out of the way and paste.
                 await overlay.settle(output)
                 overlay.hide()
+                let settleMs = lap()
                 await TextInserter.insert(output)
+                let insertMs = lap()
+
                 await log(
                     trimmed,
                     formatted: output == trimmed ? nil : output,
                     recognition: recognition,
+                    timings: .init(
+                        finalizeMs: finalizeMs,
+                        formatMs: formatMs,
+                        settleMs: settleMs,
+                        insertMs: insertMs
+                    ),
                     context: context
                 )
             }
@@ -297,6 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ raw: String,
         formatted: String?,
         recognition: [RecognitionResult],
+        timings: TranscriptEntry.Timings? = nil,
         context: RecordingContext?
     ) async {
         let elapsed = context.map { ContinuousClock.now - $0.startedAt } ?? .zero
@@ -307,7 +327,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appName: context?.appName,
             raw: raw,
             recognition: recognition.isEmpty ? nil : recognition,
-            formatted: formatted
+            formatted: formatted,
+            timings: timings
         )
         await TranscriptLog.shared.append(entry)
     }

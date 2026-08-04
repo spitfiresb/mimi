@@ -29,6 +29,21 @@ struct TranscriptEntry: Codable {
     /// What the formatting pass produced.
     var formatted: String?
 
+    /// Where the release-to-paste time went, in ms. The user feels the sum;
+    /// this says which stage to blame.
+    var timings: Timings?
+
+    struct Timings: Codable {
+        /// finalizeAndFinishThroughEndOfInput + collecting results.
+        var finalizeMs: Int
+        /// The Foundation Models pass (0 when skipped or verbatim).
+        var formatMs: Int
+        /// The settle hold — showing the cleaned text before pasting.
+        var settleMs: Int
+        /// Waiting for modifiers to clear + posting ⌘V.
+        var insertMs: Int
+    }
+
     /// What the text looked like after the user fixed it. The label.
     var corrected: String?
 }
