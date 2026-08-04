@@ -34,6 +34,7 @@ final class TranscriptionSession {
     func start(
         _ stream: AsyncStream<AnalyzerInput>,
         audioEpoch: ContinuousClock.Instant,
+        onFinalResult: @escaping @Sendable (_ text: String, _ spans: [RecognitionResult.Span]) async -> Void,
         onPreview: @escaping @Sendable (_ committed: String, _ volatile: String, _ lagMs: Int) -> Void
     ) async throws {
         let final = finalTranscriber
@@ -42,7 +43,10 @@ final class TranscriptionSession {
             var detail: [RecognitionResult] = []
             for try await result in final.results {
                 text += result.text
-                detail.append(Self.recognitionDetail(of: result))
+                let d = Self.recognitionDetail(of: result)
+                detail.append(d)
+                // Awaited so chunks arrive in order; the pipeline returns fast.
+                await onFinalResult(d.text, d.spans)
             }
             return (String(text.characters), detail)
         }
@@ -128,6 +132,10 @@ actor SpeechEngine {
             // n-best alternatives and per-run confidence the recognizer computes
             // anyway and normally discards. Logged now, used by the formatting
             // pass later.
+            // The final module emits results in chunks during dictation (the
+            // recognition log shows 4-6 per utterance), which is what lets the
+            // formatting pipeline clean sentences while the user is still
+            // speaking.
             final: SpeechTranscriber(
                 locale: locale,
                 transcriptionOptions: [],

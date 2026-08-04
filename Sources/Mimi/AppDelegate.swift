@@ -200,11 +200,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // press.
         let audioEpoch = pressAt - .milliseconds(500)
 
+        // Clean sentences while the user is still speaking; nil in verbatim mode.
+        let pipeline: FormatPipeline?
+        if UserDefaults.standard.bool(forKey: Self.verbatimKey) {
+            pipeline = nil
+        } else {
+            pipeline = FormatPipeline(formatter: formatter) { [weak self] partial in
+                Task { @MainActor in
+                    // Only surface cleaned text once the user has released —
+                    // during speech the overlay belongs to the live preview.
+                    guard let self, !self.isRecording else { return }
+                    self.overlay.stream(partial)
+                }
+            }
+        }
+        self.pipeline = pipeline
+
         startTask = Task { [weak self] in
             guard let self else { return nil }
             do {
                 let (session, _) = try await engine.makeSession()
-                try await session.start(stream, audioEpoch: audioEpoch) { [weak self] committed, volatile, lagMs in
+                try await session.start(
+                    stream,
+                    audioEpoch: audioEpoch,
+                    onFinalResult: { text, spans in
+                        await pipeline?.feed(text, spans: spans)
+                    }
+                ) { [weak self] committed, volatile, lagMs in
                     Task { @MainActor in
                         guard let self, self.isRecording else { return }
                         self.previewStats.record(lagMs: lagMs, sincePress: pressAt)
@@ -238,6 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     private var previewStats = PreviewStats()
+    private var pipeline: FormatPipeline?
 
     private func endRecording() async {
         guard isRecording else { return }
@@ -279,24 +302,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if trimmed.isEmpty {
                 overlay.hide()
             } else {
-                let formattingOn = !UserDefaults.standard.bool(forKey: Self.verbatimKey)
-
-                // Words the recognizer wasn't sure of route their sentence to
-                // the model even without visible disfluencies.
-                let suspect = Set(recognition.flatMap { result in
-                    result.spans
-                        .filter { ($0.c ?? 1.0) < Formatter.lowConfidence }
-                        .flatMap { Formatter.tokens($0.t) }
-                })
-
-                let output: String
-                if formattingOn {
-                    output = await formatter.format(trimmed, suspectTokens: suspect) { [weak self] partial in
-                        Task { @MainActor in self?.overlay.stream(partial) }
-                    }
-                } else {
-                    output = trimmed
+                // Most sentences were already cleaned while the user spoke;
+                // this waits only for the tail.
+                var output = trimmed
+                if let pipeline, trimmed.split(separator: " ").count >= Formatter.minimumWords {
+                    let cleaned = await pipeline.finish()
+                    if !cleaned.isEmpty { output = cleaned }
                 }
+                self.pipeline = nil
                 let formatMs = lap()
 
                 // Let the cleaned sentence land on screen before it lands in the
