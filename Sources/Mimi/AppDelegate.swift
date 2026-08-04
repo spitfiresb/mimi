@@ -184,7 +184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
 
         setState(symbol: "mic.fill", status: "Listening…")
-        overlay.show("Listening…")
+        overlay.show()
 
         // Belt to the wake notification's suspenders — if anything else stopped
         // the engine, revive it before capturing.
@@ -198,10 +198,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return nil }
             do {
                 let (session, _) = try await engine.makeSession()
-                try await session.start(stream) { [weak self] text in
+                try await session.start(stream) { [weak self] committed, volatile in
                     Task { @MainActor in
                         guard let self, self.isRecording else { return }
-                        self.overlay.update(text.isEmpty ? "Listening…" : text)
+                        if committed.isEmpty && volatile.isEmpty {
+                            self.overlay.update(committed: "", volatile: "Listening…")
+                        } else {
+                            self.overlay.update(committed: committed, volatile: volatile)
+                        }
                     }
                 }
                 return session
@@ -229,7 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         setState(symbol: "mic", status: "Transcribing…")
-        overlay.update("Transcribing…")
+        overlay.waiting()
 
         // Finishing the audio stream is what lets finalize() return.
         audio.stop()
@@ -240,12 +244,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // Hide before pasting so the overlay is never in the way.
-            overlay.hide()
-
-            if !trimmed.isEmpty {
+            if trimmed.isEmpty {
+                overlay.hide()
+            } else {
                 let formattingOn = !UserDefaults.standard.bool(forKey: Self.verbatimKey)
                 let output = formattingOn ? await formatter.format(trimmed) : trimmed
+
+                // Let the cleaned sentence land on screen before it lands in the
+                // document, then get out of the way and paste.
+                await overlay.settle(output)
+                overlay.hide()
                 await TextInserter.insert(output)
                 await log(
                     trimmed,

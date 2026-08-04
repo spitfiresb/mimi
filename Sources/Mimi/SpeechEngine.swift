@@ -29,7 +29,7 @@ final class TranscriptionSession {
 
     func start(
         _ stream: AsyncStream<AnalyzerInput>,
-        onPreview: @escaping @Sendable (String) -> Void
+        onPreview: @escaping @Sendable (_ committed: String, _ volatile: String) -> Void
     ) async throws {
         let final = finalTranscriber
         collector = Task {
@@ -52,11 +52,9 @@ final class TranscriptionSession {
                 for try await result in preview.results {
                     if result.isFinal {
                         committed += result.text
-                        onPreview(String(committed.characters))
+                        onPreview(String(committed.characters), "")
                     } else {
-                        var live = committed
-                        live += result.text
-                        onPreview(String(live.characters))
+                        onPreview(String(committed.characters), String(result.text.characters))
                     }
                 }
             } catch {
