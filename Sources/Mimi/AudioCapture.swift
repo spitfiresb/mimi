@@ -28,8 +28,28 @@ final class AudioCapture {
 
     private var maxPreRollFrames: AVAudioFrameCount = 0
 
+    private var outputFormat: AVAudioFormat?
+
     /// Call once at bootstrap. The engine stays running for the app's lifetime.
     func prepare(outputFormat: AVAudioFormat) throws {
+        self.outputFormat = outputFormat
+        try installTapAndStart(outputFormat: outputFormat)
+    }
+
+    /// Sleep/wake and device changes silently stop the engine — a hot mic is only
+    /// hot until the first lid close. Re-prepares from scratch: the input format
+    /// may have changed while we were down (different mic, different rate).
+    func ensureRunning() {
+        guard let outputFormat, !engine.isRunning else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        lock.lock()
+        preRoll.removeAll()
+        preRollFrames = 0
+        lock.unlock()
+        try? installTapAndStart(outputFormat: outputFormat)
+    }
+
+    private func installTapAndStart(outputFormat: AVAudioFormat) throws {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
 

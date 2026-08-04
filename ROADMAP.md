@@ -206,7 +206,8 @@ None of it improves a single word of output, which is why it waits — but all o
 blocks shipping to anyone else.
 
 - [x] Fix the press/release race — releasing the key before the session finishes starting dropped the utterance and stranded the overlay *(pulled forward 2026-08-03: hit in real use within an hour of the pull-forward rule being written)*
-- [ ] Handle input device switching, Bluetooth, sample rate changes
+- [x] Survive sleep/wake — the OS stops the hot engine on lid close; first dictation after wake hung on "Transcribing…" forever *(pulled forward 2026-08-04: wake observer re-prepares the engine, and finalization runs under a 10s watchdog with an abort path — no state may hold the UI hostage)*
+- [ ] Handle input device switching, Bluetooth, sample rate changes (partly covered: `ensureRunning()` re-reads the input format whenever the engine is found stopped)
 - [ ] Insertion fallback chain: ⌘V → AX direct set → leave on clipboard and notify
 - [ ] Configurable hotkey instead of hardcoded ⌃⌥Space
 - [ ] Stable self-signed cert so Accessibility survives rebuilds (currently reset each build by `bundle.sh`)

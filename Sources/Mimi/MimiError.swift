@@ -6,6 +6,7 @@ enum MimiError: LocalizedError {
     case noCompatibleAudioFormat
     case audioConversionUnsupported
     case notPrepared
+    case finalizeTimedOut
 
     var errorDescription: String? {
         switch self {
@@ -19,6 +20,8 @@ enum MimiError: LocalizedError {
             return "Cannot convert microphone audio to the transcriber's format."
         case .notPrepared:
             return "Speech engine is not ready yet."
+        case .finalizeTimedOut:
+            return "Transcription didn't finish in time."
         }
     }
 }

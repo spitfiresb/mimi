@@ -85,6 +85,14 @@ final class TranscriptionSession {
         return (text, recognition)
     }
 
+    /// Tear down without waiting for graceful finalization — the escape hatch
+    /// when `finish()` doesn't return.
+    func abort() async {
+        previewTask?.cancel()
+        collector?.cancel()
+        await analyzer.cancelAndFinishNow()
+    }
+
     private static func recognitionDetail(of result: SpeechTranscriber.Result) -> RecognitionResult {
         var spans: [RecognitionResult.Span] = []
         for (confidence, range) in result.text.runs[AttributeScopes.SpeechAttributes.ConfidenceAttribute.self] {

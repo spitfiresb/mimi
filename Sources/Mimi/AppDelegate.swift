@@ -142,6 +142,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // first second of speech to hardware spin-up.
             guard let format = await engine.analyzerFormat else { throw MimiError.notPrepared }
             try audio.prepare(outputFormat: format)
+
+            // Sleep kills the engine; wake must revive it or the next dictation
+            // records silence.
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.audio.ensureRunning() }
+            }
         } catch {
             setState(symbol: "mic.slash", status: "Error: \(error.localizedDescription)")
             return
@@ -177,6 +185,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         setState(symbol: "mic.fill", status: "Listening…")
         overlay.show("Listening…")
+
+        // Belt to the wake notification's suspenders — if anything else stopped
+        // the engine, revive it before capturing.
+        audio.ensureRunning()
 
         // Capture audio from the first instant; the stream buffers while the
         // session spins up.
@@ -223,7 +235,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         audio.stop()
 
         do {
-            let (text, recognition) = try await session.finish()
+            let (text, recognition) = try await Self.withTimeout(seconds: 10) {
+                try await session.finish()
+            }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
             // Hide before pasting so the overlay is never in the way.
@@ -242,8 +256,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
         } catch {
+            // However finalization failed, the UI must come back — a stuck
+            // "Transcribing…" panel is worse than a lost utterance.
+            await session.abort()
             overlay.hide()
             setState(symbol: "mic", status: "Error: \(error.localizedDescription)")
+        }
+    }
+
+    /// Race a job against a deadline. Finalization has hung before (sleep/wake
+    /// killed the engine mid-recording); nothing user-visible may await it
+    /// unbounded.
+    private static func withTimeout<T: Sendable>(
+        seconds: Double,
+        _ job: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await job() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw MimiError.finalizeTimedOut
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
         }
     }
 
