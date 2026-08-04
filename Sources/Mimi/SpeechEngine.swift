@@ -27,9 +27,14 @@ final class TranscriptionSession {
         analyzer = SpeechAnalyzer(modules: [modules.preview, modules.final], options: options)
     }
 
+    /// `audioEpoch` is when the audio stream's clock started: the keypress minus
+    /// the pre-roll. Each preview callback reports how far behind the spoken
+    /// word the recognizer is running — wall clock now vs. the audio timestamp
+    /// of the result it just produced.
     func start(
         _ stream: AsyncStream<AnalyzerInput>,
-        onPreview: @escaping @Sendable (_ committed: String, _ volatile: String) -> Void
+        audioEpoch: ContinuousClock.Instant,
+        onPreview: @escaping @Sendable (_ committed: String, _ volatile: String, _ lagMs: Int) -> Void
     ) async throws {
         let final = finalTranscriber
         collector = Task {
@@ -50,11 +55,15 @@ final class TranscriptionSession {
             var committed = AttributedString()
             do {
                 for try await result in preview.results {
+                    let audioEnd = result.range.end.seconds
+                    let lagMs = audioEnd.isFinite
+                        ? Int((ContinuousClock.now - audioEpoch) / .milliseconds(1)) - Int(audioEnd * 1000)
+                        : 0
                     if result.isFinal {
                         committed += result.text
-                        onPreview(String(committed.characters), "")
+                        onPreview(String(committed.characters), "", lagMs)
                     } else {
-                        onPreview(String(committed.characters), String(result.text.characters))
+                        onPreview(String(committed.characters), String(result.text.characters), lagMs)
                     }
                 }
             } catch {

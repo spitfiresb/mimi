@@ -194,13 +194,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // session spins up.
         let stream = audio.start()
 
+        previewStats = PreviewStats()
+        let pressAt = ContinuousClock.now
+        // Audio time zero is the head of the pre-roll, half a second before the
+        // press.
+        let audioEpoch = pressAt - .milliseconds(500)
+
         startTask = Task { [weak self] in
             guard let self else { return nil }
             do {
                 let (session, _) = try await engine.makeSession()
-                try await session.start(stream) { [weak self] committed, volatile in
+                try await session.start(stream, audioEpoch: audioEpoch) { [weak self] committed, volatile, lagMs in
                     Task { @MainActor in
                         guard let self, self.isRecording else { return }
+                        self.previewStats.record(lagMs: lagMs, sincePress: pressAt)
                         if committed.isEmpty && volatile.isEmpty {
                             self.overlay.update(committed: "", volatile: "Listening…")
                         } else {
@@ -208,6 +215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         }
                     }
                 }
+                previewStats.startupMs = Int((ContinuousClock.now - pressAt) / .milliseconds(1))
                 return session
             } catch {
                 setState(symbol: "mic", status: "Error: \(error.localizedDescription)")
@@ -215,6 +223,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
     }
+
+    /// Live-preview health, reset per recording, folded into the log entry.
+    private struct PreviewStats {
+        var startupMs: Int?
+        var firstPreviewMs: Int?
+        var maxPreviewLagMs: Int?
+
+        mutating func record(lagMs: Int, sincePress: ContinuousClock.Instant) {
+            if firstPreviewMs == nil {
+                firstPreviewMs = Int((ContinuousClock.now - sincePress) / .milliseconds(1))
+            }
+            maxPreviewLagMs = max(maxPreviewLagMs ?? 0, lagMs)
+        }
+    }
+    private var previewStats = PreviewStats()
 
     private func endRecording() async {
         guard isRecording else { return }
@@ -292,7 +315,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         finalizeMs: finalizeMs,
                         formatMs: formatMs,
                         settleMs: settleMs,
-                        insertMs: insertMs
+                        insertMs: insertMs,
+                        startupMs: previewStats.startupMs,
+                        firstPreviewMs: previewStats.firstPreviewMs,
+                        maxPreviewLagMs: previewStats.maxPreviewLagMs
                     ),
                     context: context
                 )

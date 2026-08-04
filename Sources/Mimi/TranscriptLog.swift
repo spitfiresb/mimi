@@ -42,6 +42,13 @@ struct TranscriptEntry: Codable {
         var settleMs: Int
         /// Waiting for modifiers to clear + posting ⌘V.
         var insertMs: Int
+        /// Keypress → session accepting audio (makeSession + context + start).
+        var startupMs: Int?
+        /// Keypress → first live preview text on screen.
+        var firstPreviewMs: Int?
+        /// Worst gap between a word being spoken and the preview showing it,
+        /// per the recognizer's own audio timestamps.
+        var maxPreviewLagMs: Int?
     }
 
     /// What the text looked like after the user fixed it. The label.
