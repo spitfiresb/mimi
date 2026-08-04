@@ -91,8 +91,14 @@ final class OverlayPanel {
 
     // MARK: - States
 
+    /// Monotonic token: a show() invalidates any in-flight hide, so a fade-out
+    /// completing late can never orderOut a panel that was just re-shown.
+    private var hideGeneration = 0
+
     func show() {
+        hideGeneration += 1
         render(committed: "", volatile: "Listening…", animated: false)
+        panel.alphaValue = 1
         panel.orderFrontRegardless()
         startPulse()
     }
@@ -128,10 +134,13 @@ final class OverlayPanel {
 
     func hide() {
         stopPulse()
+        hideGeneration += 1
+        let generation = hideGeneration
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.18
             panel.animator().alphaValue = 0
         } completionHandler: {
+            guard generation == self.hideGeneration else { return }
             self.panel.orderOut(nil)
             self.panel.alphaValue = 1
         }

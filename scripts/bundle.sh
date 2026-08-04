@@ -14,8 +14,21 @@ BIN="$(swift build -c "$CONFIG" --show-bin-path)/Mimi"
 # Quit a running copy so we can overwrite it. Note whether one was actually up,
 # so we can put it back afterwards — a dead menu bar app looks identical to a
 # broken hotkey, and that's a confusing half hour.
+#
+# Must VERIFY the kill: if an instance survives SIGTERM, `open` silently
+# activates the stale copy instead of launching the new binary, and every
+# "fix" after that is tested against old code.
 WAS_RUNNING=0
 pkill -x Mimi 2>/dev/null && WAS_RUNNING=1 || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	pgrep -x Mimi >/dev/null || break
+	sleep 0.3
+done
+if pgrep -x Mimi >/dev/null; then
+	echo "Mimi survived SIGTERM; escalating"
+	pkill -9 -x Mimi 2>/dev/null || true
+	sleep 1
+fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -36,10 +49,17 @@ fi
 
 echo "built $APP"
 
-# Relaunch if it was running before. Set RELAUNCH=0 to skip.
+# Relaunch if it was running before, and verify the process is genuinely new —
+# a stale survivor would make `open` a no-op. Set RELAUNCH=0 to skip.
 if [ "$WAS_RUNNING" = "1" ] && [ "${RELAUNCH:-1}" = "1" ]; then
 	open "$APP"
-	echo "relaunched Mimi"
+	sleep 1
+	AGE=$(ps -o etimes= -p "$(pgrep -x Mimi | head -1)" 2>/dev/null | tr -d ' ')
+	if [ -n "$AGE" ] && [ "$AGE" -le 15 ]; then
+		echo "relaunched Mimi (pid age ${AGE}s)"
+	else
+		echo "WARNING: Mimi process age is '${AGE:-none}' — relaunch may have failed" >&2
+	fi
 fi
 
 echo
