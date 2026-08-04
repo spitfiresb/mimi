@@ -16,8 +16,8 @@ import FoundationModels
 /// pass through verbatim. And it streams: partial output surfaces via `onPartial`
 /// so the overlay can show the cleanup happening instead of freezing.
 actor Formatter {
-    /// Everything on-device. Runs offline.
-    private var session: LanguageModelSession?
+    /// Set once prewarm has confirmed the model is available and loaded.
+    private var ready = false
 
     private static let instructions = """
         You clean up dictated text. Remove filler words (um, uh, like) and false \
@@ -69,9 +69,16 @@ actor Formatter {
     /// (~3s cold vs ~0.5s warm, measured on this machine).
     func prewarm() {
         guard isAvailable else { return }
-        let session = LanguageModelSession(instructions: Self.instructions)
-        session.prewarm()
-        self.session = session
+        LanguageModelSession(instructions: Self.instructions).prewarm()
+        ready = true
+    }
+
+    /// A fresh session per utterance. Sessions are stateful — every response
+    /// appends to their transcript, so a reused session re-reads an ever-growing
+    /// history before each reply and dictation slows down all day. The model
+    /// itself stays loaded; only the empty conversation is new.
+    private func makeSession() -> LanguageModelSession {
+        LanguageModelSession(instructions: Self.instructions)
     }
 
     /// Returns the formatted text, or the raw text whenever anything — model
@@ -87,7 +94,8 @@ actor Formatter {
         onPartial: @escaping @Sendable (String) -> Void = { _ in }
     ) async -> String {
         let words = raw.split(separator: " ")
-        guard words.count >= Self.minimumWords, let session else { return raw }
+        guard words.count >= Self.minimumWords, ready else { return raw }
+        let session = makeSession()
 
         var output = ""
         for sentence in Self.sentences(raw) {

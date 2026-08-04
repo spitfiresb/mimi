@@ -77,8 +77,15 @@ final class OverlayPanel {
         label.lineBreakMode = .byWordWrapping
         label.wantsLayer = true
 
-        blur.addSubview(glyph)
-        blur.addSubview(label)
+        // Text must not be vibrancy-blended: mid-crossfade, vibrant compositing
+        // mixes the two text snapshots darker — a black flash on every update.
+        // A non-vibrant container renders it plain, so fades stay gray-to-white.
+        let content = NonVibrantView()
+        content.autoresizingMask = [.width, .height]
+        content.addSubview(glyph)
+        content.addSubview(label)
+        blur.addSubview(content)
+        content.frame = blur.bounds
         panel.contentView = blur
     }
 
@@ -230,6 +237,10 @@ final class OverlayPanel {
         image.resizingMode = .stretch
         return image
     }
+}
+
+private final class NonVibrantView: NSView {
+    override var allowsVibrancy: Bool { false }
 }
 
 private final class NonActivatingPanel: NSPanel {
