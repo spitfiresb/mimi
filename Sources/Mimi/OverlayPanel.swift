@@ -140,9 +140,12 @@ final class OverlayPanel {
             context.duration = 0.18
             panel.animator().alphaValue = 0
         } completionHandler: {
-            guard generation == self.hideGeneration else { return }
-            self.panel.orderOut(nil)
-            self.panel.alphaValue = 1
+            // Animation completions arrive on the main thread.
+            MainActor.assumeIsolated {
+                guard generation == self.hideGeneration else { return }
+                self.panel.orderOut(nil)
+                self.panel.alphaValue = 1
+            }
         }
     }
 
