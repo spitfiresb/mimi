@@ -19,7 +19,6 @@ final class OverlayPanel {
 
     private static let minWidth: CGFloat = 220
     private static let maxWidth: CGFloat = 460
-    private static let maxLines = 3
     private static let hPad: CGFloat = 16
     private static let vPad: CGFloat = 12
     private static let glyphWidth: CGFloat = 18
@@ -46,6 +45,11 @@ final class OverlayPanel {
         panel.collectionBehavior = [
             .canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle,
         ]
+        // The HUD material is dark regardless of system theme; pin the whole
+        // panel to dark so semantic colors resolve against it. In light mode,
+        // labelColor was resolving to black before vibrancy kicked in — a black
+        // flash on every commit.
+        panel.appearance = NSAppearance(named: .darkAqua)
 
         blur = NSVisualEffectView()
         blur.material = .hudWindow
@@ -67,9 +71,10 @@ final class OverlayPanel {
         label = NSTextField(wrappingLabelWithString: "")
         label.font = Self.font
         label.textColor = .labelColor
-        label.maximumNumberOfLines = Self.maxLines
-        label.lineBreakMode = .byTruncatingHead
-        label.cell?.truncatesLastVisibleLine = true
+        // No line cap — the pill grows with the utterance. Seeing everything you
+        // said beats a tidy box.
+        label.maximumNumberOfLines = 0
+        label.lineBreakMode = .byWordWrapping
         label.wantsLayer = true
 
         blur.addSubview(glyph)
@@ -152,7 +157,9 @@ final class OverlayPanel {
             options: [.usesLineFragmentOrigin, .usesFontLeading]
         )
         let lineHeight = ceil(NSLayoutManager().defaultLineHeight(for: Self.font))
-        let textHeight = min(ceil(bounds.height), CGFloat(Self.maxLines) * lineHeight)
+        // Uncapped height, but never past the visible screen.
+        let maxTextHeight = (NSScreen.main?.visibleFrame.height ?? 800) - Self.bottomInset - 40
+        let textHeight = min(ceil(bounds.height), maxTextHeight)
         let textWidth = min(ceil(bounds.width), maxTextWidth)
 
         let width = max(Self.minWidth, textLeft + textWidth + Self.hPad)
