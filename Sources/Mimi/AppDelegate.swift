@@ -257,7 +257,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 overlay.hide()
             } else {
                 let formattingOn = !UserDefaults.standard.bool(forKey: Self.verbatimKey)
-                let output = formattingOn ? await formatter.format(trimmed) : trimmed
+
+                // Words the recognizer wasn't sure of route their sentence to
+                // the model even without visible disfluencies.
+                let suspect = Set(recognition.flatMap { result in
+                    result.spans
+                        .filter { ($0.c ?? 1.0) < Formatter.lowConfidence }
+                        .flatMap { Formatter.tokens($0.t) }
+                })
+
+                let output: String
+                if formattingOn {
+                    output = await formatter.format(trimmed, suspectTokens: suspect) { [weak self] partial in
+                        Task { @MainActor in self?.overlay.stream(partial) }
+                    }
+                } else {
+                    output = trimmed
+                }
                 let formatMs = lap()
 
                 // Let the cleaned sentence land on screen before it lands in the

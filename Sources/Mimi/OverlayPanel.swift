@@ -96,6 +96,12 @@ final class OverlayPanel {
         render(committed: committed, volatile: volatile, animated: true)
     }
 
+    /// Live output from the formatting pass — updates arrive many times a
+    /// second, so no crossfade; the text just grows.
+    func stream(_ text: String) {
+        render(committed: text, volatile: "", animated: false)
+    }
+
     /// Everything dims while the final pass runs.
     func waiting() {
         stopPulse()
@@ -108,7 +114,9 @@ final class OverlayPanel {
     func settle(_ text: String) async {
         stopPulse()
         render(committed: text, volatile: "", animated: true)
-        try? await Task.sleep(for: .milliseconds(450))
+        // Short hold: with the cleanup streamed live, the user has already
+        // watched the text form — this is a beat, not a reveal.
+        try? await Task.sleep(for: .milliseconds(250))
     }
 
     func hide() {
