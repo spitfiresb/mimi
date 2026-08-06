@@ -4,12 +4,56 @@ Local speech-to-text for the Mac. Push a key, talk, text appears where your curs
 
 ---
 
+## The press release
+
+*Written 2026-08-06, before the product it describes. Amazon-style: this is what
+must be true when we're done, and every stage below exists to make a clause of it
+true.*
+
+> **Mimi runs its own speech model on the Mac's Neural Engine — and proves it.**
+>
+> Mimi ported a streaming speech model (NVIDIA Parakeet-TDT) to Core ML with int8
+> quantization, running inference on the Apple Neural Engine at under 0.2× real
+> time. Audio reaches the model through a lock-free ring buffer gated by on-device
+> voice activity detection, and every claim is backed by a benchmark harness that
+> scores the model against Apple's own SpeechAnalyzer across the app's full log of
+> real dictations — word error rate, latency, and power, measured, not assumed.
+
+The two sentences that go on the resume, verbatim targets:
+
+1. *Ported a streaming speech model to Core ML with int8 quantization, running
+   inference on the Apple Neural Engine at under 0.2× real time* — the RTF is a
+   placeholder until measured.
+2. *Fed it from a lock-free audio ring buffer with on-device VAD, benchmarked
+   against Apple's SpeechAnalyzer across 1,000 logged utterances* — the count is
+   whatever `transcripts.jsonl` holds at print time (42 today).
+
+**No clause ships to the resume before it ships to `main`.**
+
+---
+
 ## Principles
 
-1. **Nothing leaves the machine.** Not audio, not text, not telemetry. This is architectural, not a setting.
-2. **Small.** The app should be a few megabytes, not a few hundred. No bundled model weights.
-3. **The model is a commodity.** The differentiation is everything that happens *after* transcription.
+1. **Nothing leaves the machine.** Not audio, not text, not telemetry. This is
+   architectural, not a setting. *(Unchanged — the pivot strengthens it: our own
+   weights on our own silicon is the strongest form of the claim.)*
+2. **Prove, don't assume.** Every performance claim carries its measurement: RTF
+   from the harness, ANE residency from `powermetrics`, WER from scored logs. A
+   number without a methodology is marketing.
+3. **The harness decides.** Apple's SpeechAnalyzer stays wired in as the baseline
+   and the fallback. Parakeet earns the default slot only by beating it in the
+   harness — and if it never does, the harness result *is* the deliverable.
 4. **Fast enough to feel instant.** Release the key, text is there.
+
+### What changed 2026-08-06, and why
+
+The old roadmap said *small, no bundled weights, the model is a commodity, no
+Parakeet*. That produced a real product — but a 520KB app built entirely on system
+frameworks caps out at "user of Apple's APIs." The project's actual job is to be
+the hardest engineering story Zain can truthfully tell, so the direction inverts:
+**deploy, optimize, and evaluate our own model on the Neural Engine.** The old
+non-goals are retired, not repudiated — the system-framework path stays in the app
+as the baseline arm of the benchmark, which is exactly where a commodity belongs.
 
 ---
 
@@ -19,19 +63,25 @@ Local speech-to-text for the Mac. Push a key, talk, text appears where your curs
 |---|---|
 | **OS** | macOS 26.0+ only |
 | **Hardware** | Apple Silicon only |
-| **Language** | Swift / SwiftUI |
-| **ASR engine** | Apple `SpeechTranscriber` (system framework, zero bundled weights — but a one-time OS-level asset download on first use) |
+| **Language** | Swift / SwiftUI (Python permitted in `tools/` for model conversion only) |
+| **ASR — baseline** | Apple `SpeechTranscriber` (system framework, zero bundled weights) |
+| **ASR — challenger** | Parakeet-TDT converted to Core ML, int8, ANE-pinned |
 | **Formatting** | Apple Foundation Models (on-device LLM, zero bundled weights) |
 | **Sandbox** | Off — required for Accessibility APIs |
 | **Distribution** | Developer ID direct download. Not the Mac App Store. |
 
 ### Non-goals
 
-- **No Parakeet / whisper.cpp fallback.** One engine. macOS 26+ or nothing.
 - **No cloud anything.** No API calls, no accounts, no sync.
-- **No Mac App Store.** Sandboxing blocks the Accessibility APIs this needs; every competitor ships direct for the same reason.
+- **No Mac App Store.** Sandboxing blocks the Accessibility APIs this needs.
 - **No Electron / Tauri.** Native or bust.
 - **No Intel support.**
+- **No training or fine-tuning.** We deploy and evaluate; we don't train. (Aqua
+  Voice trained a custom model and tied with free Parakeet — see Notes.)
+
+*Retired 2026-08-06:* "No Parakeet / whisper.cpp fallback" and "no bundled model
+weights" — both reversed by the press release. Whisper stays out on the merits:
+it's chunk-based and can't stream, and streaming is the product.
 
 ---
 
@@ -43,207 +93,131 @@ Dates are when the work landed on `main`.
 |---|---|
 | 2026-07-31 | Project named and scoped — README, principles, non-goals |
 | 2026-08-02 | **Stage 0 — walking skeleton.** End-to-end dictation: hold ⌃⌥Space, talk, text appears at the cursor |
-| 2026-08-02 | Live transcription overlay — a floating non-activating panel showing text as you speak (pulled forward from the wishlist) |
-| 2026-08-03 | **Stage 1 begins — transcript logging.** Every dictation appended locally as JSONL. Reordered the roadmap: output quality ahead of ergonomics |
-| 2026-08-03 | Launch at login via `SMAppService`, on by default — the app has to be running to log anything |
-| 2026-08-03 | **Stage 2 first cut — the formatting layer is live.** Foundation Models pass with invention-ratio guard, verbatim toggle, prewarm. Disfluencies, ITN, and reconstruction all working in first tests |
+| 2026-08-02 | Live transcription overlay — a floating non-activating panel showing text as you speak |
+| 2026-08-03 | **Stage 1 — transcript logging.** Every dictation appended locally as JSONL; launch at login |
+| 2026-08-03 | **Stage 2 first cut — formatting layer live.** Foundation Models pass with invention-ratio guard, verbatim toggle, prewarm |
+| 2026-08-04..05 | Overlay redesign, sleep/wake survival, press/release race fix, hot-mic pre-roll, streaming cleanup, instrumentation |
+| 2026-08-06 | PR #1 merged — Stages 1–2 on `main`. **Press-release pivot:** this roadmap rewritten around the Core ML / ANE / benchmark direction |
 
-**Current state: MVP.** The core loop works end to end and is genuinely usable.
-Collecting data; formatting layer is next.
-
----
-
-## Stages
-
-Each stage should be independently shippable and independently useful.
-
-**Ordering principle: output quality first, ergonomics last.** Everything that makes
-the text better comes before anything that makes the app nicer to hold. A rough app
-that writes what you meant beats a polished one that writes what you said.
-
-### Stage 0 — Walking skeleton ✅ *(2026-08-02)*
-
-The smallest thing that transcribes.
-
-- [x] Menu bar app, no dock icon (`LSUIElement`)
-- [x] Hardcoded push-to-talk hotkey (⌃⌥Space, hold to record)
-- [x] `AVAudioEngine` capture, converted to the analyzer's requested format
-- [x] `SpeechTranscriber` transcription
-- [x] Insert via pasteboard + synthetic ⌘V, restore previous clipboard
-- [x] Mic + Accessibility permission prompts
-- [x] First-run asset download + locale reservation
-- [x] Warm start via `modelRetention: .processLifetime` (pulled forward from Stage 5)
-- [x] Live overlay showing the transcript as you speak (pulled forward from the wishlist)
-
-**Verified:** transcribes accurately, feels instant, clipboard restores correctly, insertion works in
-TextEdit, Terminal, and other apps.
-
-Built as an SPM package; `./scripts/bundle.sh` assembles and ad-hoc signs `Mimi.app` (~220 KB).
+**Current state:** MVP on system frameworks, genuinely usable, 42 logged
+dictations. Act II begins.
 
 ---
 
-### Stage 1 — Capture everything 🟡 *(started 2026-08-03)*
+## Act I — the system-framework MVP ✅
 
-No ML. Just instrumentation, running before there's anything to instrument.
+Stages 0–2 of the old roadmap: walking skeleton, transcript logging, formatting
+layer. All shipped; details live in git history and the notes below. What Act I
+leaves behind that Act II builds on:
 
-Moved ahead of everything else because this data can only be collected *forward*.
-Every day of real use without it is a day of training data thrown away, and it's the
-one asset here a competitor can't clone.
-
-- [x] Append-only local JSONL at `~/Library/Application Support/Mimi/transcripts.jsonl`
-- [x] Log raw transcript, duration, locale, frontmost app, timestamp
-- [x] Inspectable and purgeable — "Show Transcript Log…" in the menu, one file to delete
-- [x] Failures swallowed; logging can never take dictation down with it
-- [x] Launch at login (`SMAppService`), on by default — an app that isn't running logs nothing. Ergonomics normally waits for Stage 5; this one is a data-collection prerequisite, so it jumped.
-- [ ] Fill `formatted` once Stage 2 exists
-- [ ] Detect user edits to inserted text (short window after insertion) → fill `corrected`
-- [ ] Simple review UI — see your own corrections
-- [ ] Retention policy — decide whether the log is capped, rotated, or kept forever
-
-**Done when:** every dictation produces a complete `(raw, formatted, corrected)` triple.
+- `transcripts.jsonl` — every real dictation, growing daily. Becomes the eval set.
+- `SpeechTranscriber` fully wired — becomes the baseline arm of every benchmark.
+- The formatting layer — engine-agnostic; whatever ASR wins feeds it unchanged.
+- The hot `AVAudioEngine` + 0.5s pre-roll — the thing the ring buffer replaces.
 
 ---
 
-### Stage 2 — The formatting layer
+## Act II — own the model
 
-Where the actual product is. Takes the transcript and makes it into what you meant to type.
+Ordering principle: **the harness first, because it validates everything after
+it.** A converted model without a harness is a demo; with one it's a result.
 
-**Early signal (2026-08-03, n=3 — confirm with real volume):** the premise this
-stage was written on is partly wrong. `SpeechTranscriber` already punctuates and
-capitalizes — the first logged utterances came out as *"Okay, so the current system
-seems to be live now. I'm going to start using it pretty much for everything."* Not a
-lowercase run-on. So punctuation and casing may be mostly free, and the real remaining
-value is disfluency removal, reconstruction, and ITN. Re-scope this stage once
-there's a week of log data rather than three lines.
+### Stage 3 — The eval harness
 
-- [x] Foundation Models pass over raw transcript *(2026-08-03)*
-- [x] Disfluency removal, ITN, sentence reconstruction — all handled by one prompt; the warm-up test got *"um so basically I think we should uh push the release to like thursday no wait friday"* → *"We should push the release to Friday."* and *"three thirty"* → *"3:30"* unprompted
-- [x] **Over-edit guard** — invention ratio, not edit distance: deletions are the job, invented words are the failure. >40% of output words absent from the raw → discard the rewrite, insert raw
-- [x] Toggle to disable ("Clean Up Dictation" in the menu), for when you want verbatim
-- [x] Skip the pass on very short utterances (< 3 words)
-- [x] Prewarm at bootstrap — cold ~3s, warm ~0.5–0.7s (measured 2026-08-03, M-series)
-- [x] Richer transcriber init: n-best alternatives + per-run confidence now collected and logged per dictation *(2026-08-03 — measure first: does confidence flag the real errors?)*
-- [x] `contextualStrings` wired: vocabulary.txt (one term per line) read per session, pushed via `setContext` — open question #1 is now an A/B you can run by editing a text file
-- [ ] Feed confidence + alternatives into the formatting prompt (build only if the log shows confidence flags real errors)
-- [ ] Tune the prompt against a week of real log data — n is still tiny
-- [ ] Latency: ~0.5–0.7s added per dictation. Acceptable? Watch it in real use.
+Turns the transcript log into an instrument. This is the XCTest target the
+project has never had, and the stage every later claim depends on.
 
-#### Approach: one model pass, one mechanical guard — not a rulebook
+- [ ] `MimiTests` target in `Package.swift` — first tests pin the pure logic that
+      already exists (`Formatter.needsCleaning`, `overEdited`, the invention ratio)
+- [ ] Log audio alongside text: dictations gain a WAV/CAF sidecar (opt-in flag,
+      same privacy story — local, inspectable, one folder to delete)
+- [ ] Replay harness: run any logged audio file through an ASR engine, capture
+      transcript + timings
+- [ ] WER scorer — token-level, with the standard normalizations (case,
+      punctuation, ITN forms) so the number is comparable to published figures
+- [ ] Metrics per run: WER, RTF, first-partial latency, peak RAM
+- [ ] Baseline report: SpeechAnalyzer scored across the full log — the number
+      Parakeet has to beat
 
-Rules don't scale here. ITN alone is thousands of cases, every rule is a rule you
-maintain forever, and no rule reconstructs *"send it to Bob, no wait, Sarah."* But the
-inverse — trusting a 3B model with free rein over your text — is how you get invented
-words. The split: **the model makes judgments, deterministic code enforces safety.**
+**Done when:** one command produces a scored report for a named engine across
+every logged utterance with audio.
 
-**Feed it acoustic uncertainty, not just text.** Verified in the macOS 26.5 SDK,
-`SpeechTranscriber.init(locale:transcriptionOptions:reportingOptions:attributeOptions:)`
-opts into more than the presets expose:
+### Stage 4 — Parakeet-TDT → Core ML
 
-| Option | Gives |
-|---|---|
-| `.alternativeTranscriptions` | `Result.alternatives: [AttributedString]` — n-best |
-| `.transcriptionConfidence` | per-run `Double` confidence |
-| `.audioTimeRange` | per-run timing, so pauses are visible |
+The risky stage. Conversion is where this dies if it dies.
 
-That's the acoustically-derived information a text-only model would otherwise lose —
-without touching the audio or bundling a multimodal model.
+- [ ] `tools/convert/` — Python: pull Parakeet-TDT-0.6b, export encoder/decoder/
+      joint through `coremltools` to `.mlpackage`
+- [ ] fp16 first — prove numerical parity against the PyTorch reference on a
+      handful of logged utterances before touching quantization
+- [ ] int8 quantization pass; re-verify parity (WER delta on the eval set, not
+      eyeballing)
+- [ ] Swift inference wrapper: `ParakeetEngine` conforming to the same interface
+      `SpeechEngine` uses, streaming partials as it decodes
+- [ ] TDT decode loop in Swift (token-and-duration transducer — the decoder is
+      ours to write; Core ML only runs the networks)
+- [ ] Wire into the harness as the second engine
 
-**Gate edits on confidence.** High-confidence spans are locked; the model may only
-rewrite what the recognizer was unsure of. This makes hallucination *structurally*
-hard rather than prompt-hard, which is the only kind of hard that survives contact
-with a small model.
+**Done when:** the harness scores Parakeet on the same report as SpeechAnalyzer.
 
-**Guard mechanically.** Token-level edit distance between raw and output; past a
-threshold, discard the rewrite and insert the raw text. One deterministic rule, not a
-rulebook.
+### Stage 5 — Neural Engine, proven
 
-**Apple Foundation Models is the engine.** `FoundationModels.framework` ships in the
-26.5 SDK: `LanguageModelSession.respond(to:generating:)` with `@Generable` gives
-schema-constrained decoding, so the output shape is guaranteed rather than parsed.
-Zero bundled weights, which keeps the size principle intact.
+The clause everyone else fabricates. We measure it.
 
-**It is text-only.** No audio or image input anywhere in the API surface. True
-audio→LLM would mean a third-party multimodal model via MLX — gigabytes of weights,
-which breaks the second principle outright. Revisit only if the confidence-and-
-alternatives channel proves insufficient.
+- [ ] `computeUnits = .cpuAndNeuralEngine`; verify no silent CPU fallback via
+      Instruments' Core ML/ANE trace
+- [ ] `powermetrics --samplers ane_power` capture during a harness run — ANE draw
+      while decoding is the receipt
+- [ ] Measure RTF on-ANE across the eval set; this number replaces the 0.2×
+      placeholder in the press release
+- [ ] Op-level audit: which layers fell off the ANE and why (the usual suspects:
+      unsupported ops, dynamic shapes); fix what's fixable
+- [ ] Power/thermal comparison: ANE vs CPU-only on the same workload
 
-**Done when:** the output reads like something you typed, not something you dictated.
+**Done when:** the resume bullet's every clause carries a measured number and a
+command that reproduces it.
 
-**Watch:** this adds ~200–500ms. Budget it.
+### Stage 6 — The audio path: ring buffer + VAD
 
----
+Replace the pre-roll with a real systems structure.
 
-### Stage 3 — Context awareness
+- [ ] Single-producer single-consumer lock-free ring buffer (atomic head/tail,
+      power-of-two capacity) — mic render thread writes, engine consumer reads,
+      no locks on the audio thread ever
+- [ ] Pre-roll becomes a property of the buffer (read pointer trails write by
+      0.5s) instead of a separate copy path
+- [ ] On-device VAD gating what reaches the model: start with energy +
+      hangover, evaluate Silero-VAD-CoreML if energy proves too crude
+- [ ] Harness gains a VAD metric: false-trigger rate and clipped-word rate
+      against the logged set
 
-The same sentence should land differently in different apps.
+**Done when:** the audio thread allocates nothing, locks nothing, and the model
+never sees silence.
 
-- [x] Detect the frontmost app *(landed with Stage 1 logging)*
-- [ ] Per-app formatting profiles (code editor vs Slack vs email vs docs)
-- [ ] Code context: identifiers, no prose punctuation, camelCase/snake_case awareness
-- [ ] Chat context: shorter, looser, no terminal period
-- [ ] User-editable profiles
+### Stage 7 — Publish the benchmark
 
----
+The credential, unchanged from the old roadmap but now with our own entrant.
 
-### Stage 4 — Personalization
-
-The moat. Nobody in this category does it — every product ships a static prompt and learns nothing.
-
-- [ ] Build a per-user vocabulary from corrections (names, jargon, repos, coworkers)
-- [ ] Feed it into the formatting prompt
-- [ ] Investigate contextual biasing at the ASR layer (published gains: 30–48% relative rare-word recall — far more than any model swap)
-- [ ] Learn per-user formatting habits, not just vocabulary
-- [ ] Measure it: does WER on the user's own speech drop over time?
-
-**Done when:** it's measurably better after a month of use than on day one.
+- [ ] Full matrix: SpeechAnalyzer vs Parakeet-fp16 vs Parakeet-int8 × WER × RTF ×
+      RAM × power, on real dictation audio
+- [ ] Publish harness, methodology, results
+- [ ] The winner becomes Mimi's default engine — principle 3 settles it
 
 ---
 
-### Stage 5 — Make it reliable
+## Act III — product hardening
 
-Deliberately late. Stage 0 works on the happy path; this makes it work every time.
-None of it improves a single word of output, which is why it waits — but all of it
-blocks shipping to anyone else.
+Unchanged in substance from the old Stages 3–6; compressed here, expanded when
+Act II lands.
 
-- [x] Fix the press/release race — releasing the key before the session finishes starting dropped the utterance and stranded the overlay *(pulled forward 2026-08-03: hit in real use within an hour of the pull-forward rule being written)*
-- [x] Survive sleep/wake — the OS stops the hot engine on lid close; first dictation after wake hung on "Transcribing…" forever *(pulled forward 2026-08-04: wake observer re-prepares the engine, and finalization runs under a 10s watchdog with an abort path — no state may hold the UI hostage)*
-- [ ] Handle input device switching, Bluetooth, sample rate changes (partly covered: `ensureRunning()` re-reads the input format whenever the engine is found stopped)
-- [ ] Insertion fallback chain: ⌘V → AX direct set → leave on clipboard and notify
-- [ ] Configurable hotkey instead of hardcoded ⌃⌥Space
-- [ ] Stable self-signed cert so Accessibility survives rebuilds (currently reset each build by `bundle.sh`)
-- [ ] Install to `/Applications` — the login item registers whatever path the bundle is at, and `build/` is deleted every build
-- [ ] Recording indicator in the menu bar
-- [ ] Graceful failure states (no mic permission, no Accessibility, engine unavailable)
-- [ ] First-run onboarding for the two permission grants
-
-**Done when:** it survives a day of real use without a manual restart.
-
-**Pull forward if:** a bug starts costing you dictations often enough that you stop
-reaching for the app. Broken tools don't generate training data.
-
----
-
-### Stage 6 — Ship it
-
-- [ ] Developer ID Application certificate
-- [ ] Hardened Runtime, entitlements: sandbox off, `device.audio-input`, `network.client`
-- [ ] `NSMicrophoneUsageDescription` (Accessibility and Input Monitoring have no usage-description keys — they're pure runtime TCC consent)
-- [ ] Notarize + staple
-- [ ] Sparkle 2.9.x for updates
-- [ ] DMG with a real installer experience
-- [ ] Landing page
-
----
-
-### Stage 7 — The benchmark
-
-The credential. Nobody publishes on-device dictation numbers, and the hardware everyone else lacks is the hardware you have.
-
-- [ ] Eval harness: WER × latency × RAM × battery on Apple Silicon
-- [ ] Formatting benchmark — punctuation, casing, ITN, disfluency, reconstruction. Measured separately from acoustic WER, because it's ~3× the effect size on clean audio.
-- [ ] Run across engines and Mac models
-- [ ] Publish: harness, methodology, results
-- [ ] Consider submitting a *model* to the Open ASR Leaderboard (documented path, ~$3–6/run). Not a dataset — zero community datasets have ever been merged.
+- **Context awareness** — per-app formatting profiles (code vs chat vs email)
+- **Personalization** — vocabulary from corrections; contextual biasing at the
+  ASR layer (published gains: 30–48% relative rare-word recall)
+- **Reliability** — device switching, insertion fallback chain, configurable
+  hotkey, stable signing, `/Applications` install, graceful failure states
+- **Ship it** — Developer ID, notarize + staple, Sparkle, DMG, GitHub Actions
+  building/signing/notarizing on tag (CI becomes honest resume material here),
+  landing page
 
 ---
 
@@ -251,46 +225,72 @@ The credential. Nobody publishes on-device dictation numbers, and the hardware e
 
 Unscheduled. Pull forward if something proves important.
 
-- Voice commands — "new paragraph", "scratch that", "delete that"
-- Streaming insertion — text lands in the *target app* as you speak. The live overlay (done 2026-08-02) covers the preview half of this; inline insertion is the part left, and it conflicts with the Stage 2 formatting pass, which needs the whole utterance before it can rewrite anything.
-- Configurable hotkey; double-tap-modifier support
-- Multiple profiles / modes (dictation, code, command)
-- Transcript history window
-- Auto-stop on silence via `SpeechDetector`
-- Custom vocabulary UI (manual entry, ahead of Stage 4 learning it)
-- Multi-language
-- Per-app enable/disable
-- Sound or haptic on start/stop
-- Menu bar waveform
-- CLI for scripting
+- Voice commands — "new paragraph", "scratch that"
+- Streaming insertion into the target app (conflicts with the formatting pass;
+  the overlay covers the preview half)
+- Multiple profiles / modes; per-app enable/disable
+- Transcript history window; custom vocabulary UI
+- Auto-stop on silence via `SpeechDetector` (partially superseded by Stage 6 VAD)
+- Multi-language; sound/haptic on start/stop; menu bar waveform; CLI
 
 ---
 
 ## Open questions
 
-1. **Does `SpeechTranscriber` honor custom vocabulary?** Partly resolved by reading the SDK: `contextualStrings` lives on `AnalysisContext`, which `SpeechAnalyzer.init(…analysisContext:)` accepts for *any* module — so it is **not** restricted to `DictationTranscriber` as the docs imply. The API path is open. Whether `SpeechTranscriber` actually acts on it is still an empirical test, and it gates Stage 4's biasing work. Cheap to answer — worth doing early, because a "no" changes how personalization reaches the ASR layer at all. Further confirmed in the 26.5 SDK: `contextualStrings` is keyed by a `ContextualStringsTag` (`.general` provided), and `SpeechAnalyzer.setContext(_:)` updates it *mid-session* — so learned vocabulary can be pushed in without tearing down the analyzer. The plumbing is better than expected; only the behaviour is unproven.
-2. **How much latency will users tolerate** for the formatting pass before wanting it off?
-3. **What's the right correction-detection window** in Stage 1 before edits stop being "corrections" and start being ordinary editing?
+1. **Does `SpeechTranscriber` honor `contextualStrings`?** Plumbing confirmed in
+   the 26.5 SDK (`setContext` works mid-session); behaviour still unproven. Now
+   also a harness question — measurable the day Stage 3 lands.
+2. **Can the TDT decode loop hit streaming latency in Swift**, or does the
+   joint-network round-trip per token need batching tricks? The conversion can
+   succeed and the streaming still fail — this is Stage 4's real risk, not the
+   export.
+3. **Audio retention policy** — sidecar WAVs are ~1MB per 30s. Cap, rotate, or
+   keep? (Supersedes the old text-log retention question; text is negligible.)
+4. **What latency will users tolerate** for the formatting pass before wanting
+   it off?
 
 ---
 
 ## Notes worth keeping
 
-- **Formatting > acoustics.** Removing punctuation changes WER by 2.0–4.1% absolute; total acoustic error on clean audio is ~0.92%. The formatting layer is roughly 3× the effect size of the model choice.
-- **The ASR field is saturated on clean speech.** SOTA on LibriSpeech test-clean is 0.92%; professional human transcribers beat Whisper by a fraction of a point. There's nothing acoustic left to win on near-field dictation audio.
-- **Aqua Voice's own proprietary model scores ~5.2 average WER** — statistically tied with free Parakeet. A dictation company trained a custom model and gained nothing measurable. Don't repeat that experiment.
-- **Argmax is the template**: open-source WhisperKit → became the reference implementation for on-device ASR on Apple Silicon → commercial SDK. They never topped a leaderboard.
-- **Never `codesign --deep`.** Sign inside-out. `--deep` is fine for verification only.
+- **Formatting > acoustics.** Removing punctuation changes WER by 2.0–4.1%
+  absolute; total acoustic error on clean audio is ~0.92%. The formatting layer
+  is ~3× the effect size of the model choice. *(This is why the harness scores
+  formatting separately — and why Parakeet losing on WER wouldn't sink the
+  project. The deployment story is the deliverable.)*
+- **The ASR field is saturated on clean speech.** SOTA on LibriSpeech test-clean
+  is 0.92%; there's nothing acoustic left to win on near-field dictation audio.
+- **Aqua Voice's proprietary model scores ~5.2 WER** — statistically tied with
+  free Parakeet. Deploy, don't train.
+- **Argmax is the template**: WhisperKit → reference implementation for on-device
+  ASR on Apple Silicon → commercial SDK. They never topped a leaderboard; they
+  owned the *deployment* story. That is precisely the Act II thesis.
+- **Never `codesign --deep`.** Sign inside-out. `--deep` is for verification only.
 
 ### Implementation gotchas already hit
 
-- **Physical modifiers merge with synthesized ones.** On release the user is often still holding ⌃⌥, which turns a synthesized ⌘V into ⌃⌥⌘V and pastes nothing. `TextInserter` waits for modifiers to clear first.
-- **Ad-hoc signing invalidates Accessibility silently.** TCC keys approval to the code hash, which changes every build — so a previously-granted toggle still reads "on" while being invalid. `bundle.sh` runs `tccutil reset Accessibility` to force a clean re-grant. No sudo needed.
-- **`CGEventTap` gets disabled by the system on timeout**, silently. Must handle `.tapDisabledByTimeout` and re-enable, or the hotkey just stops working.
-- **Stamp synthesized events** with `CGEventSource.userData` and ignore them in the tap, so the app can't retrigger itself.
-- **`AVAudioEngine` input format ≠ analyzer format.** Ask `SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith:)` and convert; don't assume 16kHz.
-- **Live preview needs two transcriber modules, not one filtered on `isFinal`.** A module emitting volatile results is not required to reissue them as final if finalization didn't change them — so filtering one progressive module silently drops text. Run a `.progressiveTranscription` module for the preview and a separate `.transcription` module for the authoritative transcript. The progressive preset also carries `fastResults` ("faster but less accurate") — fine to show, wrong to insert.
-- **The preview overlay must never become key or main.** If it takes focus, the synthesized ⌘V lands in the overlay instead of the user's app.
-- **A dead menu bar app is indistinguishable from a broken hotkey.** `LSUIElement` means no dock icon and no window, so when `bundle.sh` quit the running copy and didn't relaunch it, the only symptom was ⌃⌥Space doing nothing. The script now relaunches if a copy was up. Suspect "is it even running?" before debugging the event tap.
-- **On-demand mic start eats the head of the utterance.** Starting `AVAudioEngine` at keypress loses ~1s to hardware spin-up — "the quarterly report" transcribed as "orderly report", leading disfluencies vanished entirely. First caught by comparing the transcript log against a competitor at the same distance (the log paid for itself in day one). Fix: engine runs from launch, idle audio goes to a 0.5s rolling pre-roll, and `start()` flushes the pre-roll into the stream ahead of live frames.
-- **The login item registers the bundle's current path.** `SMAppService.mainApp` points at wherever `Mimi.app` sits right now — today that's `build/`, which `bundle.sh` deletes and recreates every run. Fine for development, wrong for real use: the app needs to live in `/Applications` before launch-at-login can be trusted.
+- **Physical modifiers merge with synthesized ones.** On release the user is often
+  still holding ⌃⌥, turning a synthesized ⌘V into ⌃⌥⌘V. `TextInserter` waits for
+  modifiers to clear first.
+- **Ad-hoc signing invalidates Accessibility silently.** TCC keys approval to the
+  code hash. `bundle.sh` runs `tccutil reset Accessibility` each build.
+- **`CGEventTap` gets disabled by the system on timeout**, silently. Handle
+  `.tapDisabledByTimeout` and re-enable.
+- **Stamp synthesized events** with `CGEventSource.userData` and ignore them in
+  the tap, so the app can't retrigger itself.
+- **`AVAudioEngine` input format ≠ analyzer format.** Ask
+  `bestAvailableAudioFormat(compatibleWith:)` and convert; don't assume 16kHz.
+- **Live preview needs two transcriber modules, not one filtered on `isFinal`.**
+  A volatile module isn't required to reissue unchanged results as final —
+  filtering one module silently drops text. Progressive module for preview,
+  `.transcription` module for the authoritative text.
+- **The preview overlay must never become key or main**, or the synthesized ⌘V
+  lands in the overlay.
+- **A dead menu bar app is indistinguishable from a broken hotkey.** Suspect "is
+  it even running?" before debugging the event tap.
+- **On-demand mic start eats the head of the utterance** (~1s hardware spin-up).
+  Engine runs from launch; idle audio goes to a 0.5s pre-roll flushed into the
+  stream at keypress. *(Stage 6 rebuilds this as the ring buffer.)*
+- **The login item registers the bundle's current path** — today `build/`, which
+  `bundle.sh` recreates every run. The app needs `/Applications` before
+  launch-at-login can be trusted.
