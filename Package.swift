@@ -9,6 +9,26 @@ let package = Package(
             name: "Mimi",
             path: "Sources/Mimi",
             swiftSettings: [.swiftLanguageMode(.v5)]
-        )
+        ),
+        // The eval harness: WER scoring, dataset loading, and engine adapters.
+        // A library so both the CLI and the tests can use it. Deliberately free
+        // of app types — engines plug in behind one protocol.
+        .target(
+            name: "EvalKit",
+            path: "Sources/EvalKit",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "mimi-eval",
+            dependencies: ["EvalKit"],
+            path: "Sources/mimi-eval",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "MimiTests",
+            dependencies: ["Mimi", "EvalKit"],
+            path: "Tests/MimiTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )
