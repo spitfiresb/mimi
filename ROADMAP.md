@@ -122,25 +122,30 @@ leaves behind that Act II builds on:
 Ordering principle: **the harness first, because it validates everything after
 it.** A converted model without a harness is a demo; with one it's a result.
 
-### Stage 3 — The eval harness
+### Stage 3 — The eval harness 🟡 *(started 2026-08-06)*
 
-Turns the transcript log into an instrument. This is the XCTest target the
-project has never had, and the stage every later claim depends on.
+The XCTest target the project has never had, and the stage every later claim
+depends on. Eval set decision (2026-08-06): **LibriSpeech test-clean from
+OpenSLR**, not audio sidecars on the transcript log — human-verified references,
+2,620 utterances, comparable to published figures. Own-voice sidecars demoted to
+a supplement (wishlist) rather than a prerequisite.
 
-- [ ] `MimiTests` target in `Package.swift` — first tests pin the pure logic that
-      already exists (`Formatter.needsCleaning`, `overEdited`, the invention ratio)
-- [ ] Log audio alongside text: dictations gain a WAV/CAF sidecar (opt-in flag,
-      same privacy story — local, inspectable, one folder to delete)
-- [ ] Replay harness: run any logged audio file through an ASR engine, capture
-      transcript + timings
-- [ ] WER scorer — token-level, with the standard normalizations (case,
-      punctuation, ITN forms) so the number is comparable to published figures
-- [ ] Metrics per run: WER, RTF, first-partial latency, peak RAM
-- [ ] Baseline report: SpeechAnalyzer scored across the full log — the number
+- [x] `MimiTests` target in `Package.swift` — pins `Formatter`'s deterministic
+      halves (routing, sentence split, invention guard) and the WER scorer
+- [x] `EvalKit` library + `mimi-eval` CLI — run a LibriSpeech-format directory
+      through any `EvalEngine`, capture transcript + timings
+- [x] WER scorer — token-level Levenshtein with error-kind backtrace, corpus
+      aggregation, case/punctuation-free normalization (no ITN denorm — both
+      engines face the same charge, so A/B stays fair; absolutes read high)
+- [x] `scripts/fetch-librispeech.sh` — test-clean into `datasets/` (gitignored)
+- [x] Metrics per run: WER (sub/ins/del), RTF; per-utterance JSON report
+- [ ] First-partial latency and peak RAM metrics (needs a streaming-aware
+      engine interface — arrives with ParakeetEngine, which actually streams)
+- [ ] Baseline report: SpeechAnalyzer scored across test-clean — the number
       Parakeet has to beat
 
 **Done when:** one command produces a scored report for a named engine across
-every logged utterance with audio.
+the eval set. *(True today; the baseline number lands this stage too.)*
 
 ### Stage 4 — Parakeet-TDT → Core ML
 
