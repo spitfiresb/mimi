@@ -141,11 +141,18 @@ a supplement (wishlist) rather than a prerequisite.
 - [x] Metrics per run: WER (sub/ins/del), RTF; per-utterance JSON report
 - [ ] First-partial latency and peak RAM metrics (needs a streaming-aware
       engine interface — arrives with ParakeetEngine, which actually streams)
-- [ ] Baseline report: SpeechAnalyzer scored across test-clean — the number
-      Parakeet has to beat
+- [x] Baseline report: SpeechAnalyzer scored across test-clean — the number
+      Parakeet has to beat. **Measured 2026-08-06, full 2,620 utterances
+      (5.4h audio): WER 2.34% (950 sub / 115 ins / 166 del over 52,576 words),
+      RTF 0.028×** (5.4h transcribed in 9.1 min). Worst errors are proper
+      nouns ("Stephanos Dedalos") and contraction expansions ("he's" → "He
+      is") — the latter is the no-ITN-denorm charge, applied equally to every
+      engine. Parakeet-TDT-0.6b's published test-clean WER is ~1.7% with a
+      text normalizer; under this harness's stricter scoring, beating 2.34%
+      is a real but plausible target.
 
 **Done when:** one command produces a scored report for a named engine across
-the eval set. *(True today; the baseline number lands this stage too.)*
+the eval set. ✅
 
 ### Stage 4 — Parakeet-TDT → Core ML
 
