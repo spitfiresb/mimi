@@ -17,7 +17,7 @@ final class TranscriptionSession {
     private let finalTranscriber: SpeechTranscriber
     private let analyzer: SpeechAnalyzer
 
-    private var collector: Task<String, Error>?
+    private var collector: Task<(String, [RecognitionResult]), Error>?
     private var previewTask: Task<Void, Never>?
 
     init(locale: Locale, options: SpeechAnalyzer.Options) {
@@ -27,17 +27,28 @@ final class TranscriptionSession {
         analyzer = SpeechAnalyzer(modules: [modules.preview, modules.final], options: options)
     }
 
+    /// `audioEpoch` is when the audio stream's clock started: the keypress minus
+    /// the pre-roll. Each preview callback reports how far behind the spoken
+    /// word the recognizer is running — wall clock now vs. the audio timestamp
+    /// of the result it just produced.
     func start(
         _ stream: AsyncStream<AnalyzerInput>,
-        onPreview: @escaping @Sendable (String) -> Void
+        audioEpoch: ContinuousClock.Instant,
+        onFinalResult: @escaping @Sendable (_ text: String, _ spans: [RecognitionResult.Span]) async -> Void,
+        onPreview: @escaping @Sendable (_ committed: String, _ volatile: String, _ lagMs: Int) -> Void
     ) async throws {
         let final = finalTranscriber
         collector = Task {
             var text = AttributedString()
+            var detail: [RecognitionResult] = []
             for try await result in final.results {
                 text += result.text
+                let d = Self.recognitionDetail(of: result)
+                detail.append(d)
+                // Awaited so chunks arrive in order; the pipeline returns fast.
+                await onFinalResult(d.text, d.spans)
             }
-            return String(text.characters)
+            return (String(text.characters), detail)
         }
 
         let preview = previewTranscriber
@@ -48,13 +59,15 @@ final class TranscriptionSession {
             var committed = AttributedString()
             do {
                 for try await result in preview.results {
+                    let audioEnd = result.range.end.seconds
+                    let lagMs = audioEnd.isFinite
+                        ? Int((ContinuousClock.now - audioEpoch) / .milliseconds(1)) - Int(audioEnd * 1000)
+                        : 0
                     if result.isFinal {
                         committed += result.text
-                        onPreview(String(committed.characters))
+                        onPreview(String(committed.characters), "", lagMs)
                     } else {
-                        var live = committed
-                        live += result.text
-                        onPreview(String(live.characters))
+                        onPreview(String(committed.characters), String(result.text.characters), lagMs)
                     }
                 }
             } catch {
@@ -62,17 +75,48 @@ final class TranscriptionSession {
             }
         }
 
+        // Bias recognition toward the user's vocabulary. Read per session so
+        // edits to the file apply to the next dictation. Whether SpeechTranscriber
+        // honors this is roadmap open question #1 — the log will tell us.
+        let terms = Vocabulary.terms()
+        if !terms.isEmpty {
+            let context = AnalysisContext()
+            context.contextualStrings = [.general: terms]
+            try? await analyzer.setContext(context)
+        }
+
         try await analyzer.start(inputSequence: stream)
     }
 
     /// Call *after* the audio stream has been finished, or this will hang.
-    func finish() async throws -> String {
+    func finish() async throws -> (text: String, recognition: [RecognitionResult]) {
         try await analyzer.finalizeAndFinishThroughEndOfInput()
-        let text = try await collector?.value ?? ""
+        let (text, recognition) = try await collector?.value ?? ("", [])
         previewTask?.cancel()
-        return text
+        return (text, recognition)
     }
 
+    /// Tear down without waiting for graceful finalization — the escape hatch
+    /// when `finish()` doesn't return.
+    func abort() async {
+        previewTask?.cancel()
+        collector?.cancel()
+        await analyzer.cancelAndFinishNow()
+    }
+
+    private static func recognitionDetail(of result: SpeechTranscriber.Result) -> RecognitionResult {
+        var spans: [RecognitionResult.Span] = []
+        for (confidence, range) in result.text.runs[AttributeScopes.SpeechAttributes.ConfidenceAttribute.self] {
+            let t = String(result.text[range].characters)
+            guard !t.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            spans.append(.init(t: t, c: confidence))
+        }
+        return RecognitionResult(
+            text: String(result.text.characters),
+            alts: result.alternatives.prefix(3).map { String($0.characters) },
+            spans: spans
+        )
+    }
 }
 
 actor SpeechEngine {
@@ -84,7 +128,20 @@ actor SpeechEngine {
     static func makeModules(locale: Locale) -> (preview: SpeechTranscriber, final: SpeechTranscriber) {
         (
             preview: SpeechTranscriber(locale: locale, preset: .progressiveTranscription),
-            final: SpeechTranscriber(locale: locale, preset: .transcription)
+            // Explicit init instead of the .transcription preset: we also want the
+            // n-best alternatives and per-run confidence the recognizer computes
+            // anyway and normally discards. Logged now, used by the formatting
+            // pass later.
+            // The final module emits results in chunks during dictation (the
+            // recognition log shows 4-6 per utterance), which is what lets the
+            // formatting pipeline clean sentences while the user is still
+            // speaking.
+            final: SpeechTranscriber(
+                locale: locale,
+                transcriptionOptions: [],
+                reportingOptions: [.alternativeTranscriptions],
+                attributeOptions: [.transcriptionConfidence]
+            )
         )
     }
 
