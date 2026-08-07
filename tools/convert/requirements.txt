@@ -1,0 +1,7 @@
+# Parakeet-TDT -> Core ML conversion environment. macOS arm64, Python 3.12.
+# nemo_toolkit pulls torch; coremltools does the export. Pinned loosely --
+# the parity script is what actually guarantees correctness.
+nemo_toolkit[asr]>=2.0
+coremltools>=8.0
+torch>=2.4
+soundfile

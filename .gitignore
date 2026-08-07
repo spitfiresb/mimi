@@ -5,3 +5,6 @@ build/
 xcuserdata/
 datasets/
 eval-results/
+tools/convert/.venv/
+tools/convert/models/
+__pycache__/
