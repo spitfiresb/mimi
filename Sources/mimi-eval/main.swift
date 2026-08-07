@@ -9,15 +9,27 @@ import Foundation
 /// full per-utterance report to eval-results/<engine>-<count>.json.
 
 func usage() -> Never {
-    print("usage: mimi-eval <librispeech-dir> [--limit N]")
+    print("usage: mimi-eval <librispeech-dir> [--limit N] [--engine apple|parakeet-int8|parakeet-fp16|all] [--models <dir>]")
     exit(2)
 }
 
 var arguments = Array(CommandLine.arguments.dropFirst())
 var limit = Int.max
+var engineChoice = "apple"
+var modelsDir = URL(fileURLWithPath: "tools/convert/models")
 if let flag = arguments.firstIndex(of: "--limit") {
     guard flag + 1 < arguments.count, let n = Int(arguments[flag + 1]), n > 0 else { usage() }
     limit = n
+    arguments.removeSubrange(flag...(flag + 1))
+}
+if let flag = arguments.firstIndex(of: "--engine") {
+    guard flag + 1 < arguments.count else { usage() }
+    engineChoice = arguments[flag + 1]
+    arguments.removeSubrange(flag...(flag + 1))
+}
+if let flag = arguments.firstIndex(of: "--models") {
+    guard flag + 1 < arguments.count else { usage() }
+    modelsDir = URL(fileURLWithPath: arguments[flag + 1])
     arguments.removeSubrange(flag...(flag + 1))
 }
 guard arguments.count == 1 else { usage() }
@@ -37,8 +49,15 @@ guard !all.isEmpty else {
 let utterances = Array(all.prefix(limit))
 print("scoring \(utterances.count) of \(all.count) utterances from \(root.lastPathComponent)\n")
 
-let engines: [any EvalEngine] = [AppleEngine()]
-// Stage 4 adds ParakeetEngine() here. Same report, same referee.
+let engines: [any EvalEngine] = switch engineChoice {
+case "apple": [AppleEngine()]
+case "parakeet-int8": [ParakeetEngine(modelsDir: modelsDir, int8: true)]
+case "parakeet-fp16": [ParakeetEngine(modelsDir: modelsDir, int8: false)]
+case "all": [AppleEngine(),
+             ParakeetEngine(modelsDir: modelsDir, int8: false),
+             ParakeetEngine(modelsDir: modelsDir, int8: true)]
+default: usage()
+}
 
 for engine in engines {
     print("== \(engine.name) ==")
@@ -47,9 +66,8 @@ for engine in engines {
         over: utterances,
         audioSeconds: { try AppleEngine.audioSeconds(of: $0) },
         progress: { done, total, score in
-            if done % 25 == 0 || done == total {
-                print("  \(done)/\(total)  running WER so far is per-file; corpus WER prints at the end")
-            }
+            print(String(format: "  %d/%d  %@  wer %.0f%%  %.1fs", done, total, score.id, score.wer * 100, score.processingSeconds))
+            fflush(stdout)
         }
     )
 

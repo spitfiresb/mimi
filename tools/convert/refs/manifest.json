@@ -1,0 +1,20 @@
+[
+  {
+    "id": "1089-134686-0001",
+    "flac": "../../datasets/LibriSpeech/test-clean/1089/134686/1089-134686-0001.flac",
+    "reference": "STUFF IT INTO YOU HIS BELLY COUNSELLED HIM",
+    "samples": 52400,
+    "mel_bins": 128,
+    "mel_frames": 328,
+    "duration": 3.275
+  },
+  {
+    "id": "1089-134686-0003",
+    "flac": "../../datasets/LibriSpeech/test-clean/1089/134686/1089-134686-0003.flac",
+    "reference": "HELLO BERTIE ANY GOOD IN YOUR MIND",
+    "samples": 42880,
+    "mel_bins": 128,
+    "mel_frames": 269,
+    "duration": 2.68
+  }
+]

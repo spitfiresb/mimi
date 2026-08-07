@@ -72,8 +72,16 @@ public enum Harness {
         var totalProcessing = 0.0
 
         for (index, utterance) in utterances.enumerated() {
-            let seconds = try audioSeconds(utterance.audioURL)
-            let (text, processing) = try await engine.transcribe(utterance.audioURL)
+            let seconds = (try? audioSeconds(utterance.audioURL)) ?? 0
+            // One failed utterance must not kill a benchmark: score it as an
+            // empty hypothesis (all deletions) and keep going.
+            let (text, processing): (String, Duration)
+            do {
+                (text, processing) = try await engine.transcribe(utterance.audioURL)
+            } catch {
+                FileHandle.standardError.write(Data("  ERROR \(utterance.id): \(error)\n".utf8))
+                (text, processing) = ("", .zero)
+            }
             let result = WER.score(reference: utterance.reference, hypothesis: text)
             let processingSeconds = Double(processing.components.seconds)
                 + Double(processing.components.attoseconds) / 1e18
