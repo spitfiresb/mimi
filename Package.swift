@@ -24,6 +24,7 @@ let package = Package(
             path: "Sources/mimi-eval",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .executableTarget(name: "encprobe", dependencies: ["EvalKit"], path: "Sources/encprobe", swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(
             name: "MimiTests",
             dependencies: ["Mimi", "EvalKit"],

@@ -77,16 +77,24 @@ def convert(model, args):
     compute = {"fp16": ct.precision.FLOAT16, "int8": ct.precision.FLOAT16}[args.precision]
     suffix = "" if args.precision == "fp16" else "-int8"
 
-    # --- encoder: flexible time axis ---
+    # --- encoder: enumerated time axis ---
+    # Three fixed windows (3s / 15s / 30s), matching ParakeetEngine.windows.
+    # A RangeDim axis produces an E5 program with no FlexibleShapeInformation:
+    # the ANE can't run it (BNNS crashes outright on .cpuOnly / .cpuAndNeuralEngine)
+    # and every previously unseen shape pays a 40-90s runtime re-specialization.
+    # Enumerated shapes are precompiled per-variant and ANE-eligible.
     enc = EncoderWrapper(model.encoder).eval()
-    T = 1501  # 15s of 10ms mel frames as the trace example; RangeDim keeps it flexible
+    T = 1501  # 15s of 10ms mel frames as the trace example
     mel = torch.randn(1, mel_dim, T)
     length = torch.tensor([T], dtype=torch.int32)
     traced = torch.jit.trace(enc, (mel, length))
+    enc_shapes = ct.EnumeratedShapes(
+        shapes=[(1, mel_dim, t) for t in (301, 1501, 3001)], default=(1, mel_dim, T)
+    )
     mlmodel = ct.convert(
         traced,
         inputs=[
-            ct.TensorType(name="mel", shape=(1, mel_dim, ct.RangeDim(1, 3001, default=T)), dtype=np.float32),
+            ct.TensorType(name="mel", shape=enc_shapes, dtype=np.float32),
             ct.TensorType(name="length", shape=(1,), dtype=np.int32),
         ],
         outputs=[ct.TensorType(name="encoded"), ct.TensorType(name="encoded_len")],
@@ -99,6 +107,8 @@ def convert(model, args):
         mlmodel = quantize_int8(mlmodel)
     mlmodel.save(str(OUT / f"ParakeetEncoder{suffix}.mlpackage"))
     print("encoder saved")
+    if args.only == "encoder":
+        return
 
     # --- decoder step ---
     dec = DecoderWrapper(model.decoder).eval()
@@ -188,6 +198,7 @@ def quantize_int8(mlmodel):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--precision", choices=["fp16", "int8"], default="fp16")
+    parser.add_argument("--only", choices=["encoder", "all"], default="all")
     args = parser.parse_args()
 
     model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")

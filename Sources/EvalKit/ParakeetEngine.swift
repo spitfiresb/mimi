@@ -38,19 +38,42 @@ public final class ParakeetEngine: EvalEngine {
         self.name = int8 ? "Parakeet-int8" : "Parakeet-fp16"
     }
 
+    /// `MLModel.compileModel` writes a ~1.2GB `.mlmodelc` into the system temp
+    /// directory on every call and never cleans it up (38GB of orphans found on
+    /// 2026-08-07). Compile once into a `compiled/` cache beside the packages,
+    /// invalidated by the package's modification date.
+    public static func compiledURL(for package: URL) throws -> URL {
+        let fm = FileManager.default
+        let cacheDir = package.deletingLastPathComponent().appendingPathComponent("compiled")
+        let cached = cacheDir.appendingPathComponent(
+            package.deletingPathExtension().lastPathComponent + ".mlmodelc")
+        let packageDate = try fm.attributesOfItem(atPath: package.path)[.modificationDate] as? Date
+        if fm.fileExists(atPath: cached.path),
+           let cachedDate = try? fm.attributesOfItem(atPath: cached.path)[.modificationDate] as? Date,
+           let packageDate, cachedDate > packageDate {
+            return cached
+        }
+        try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        let temp = try MLModel.compileModel(at: package)
+        if fm.fileExists(atPath: cached.path) { try fm.removeItem(at: cached) }
+        try fm.moveItem(at: temp, to: cached)
+        return cached
+    }
+
     public func prepare() async throws {
         let config = MLModelConfiguration()
-        // CPU_AND_NE segfaults in BNNS graph compile (see Stage 4a); .all lets
-        // unsupported segments fall to GPU. Stage 5 audits actual ANE residency.
-        config.computeUnits = .all
+        // CPU_AND_NE still segfaults in BNNS E5 init even with enumerated shapes
+        // ("Cannot retrieve vector from IRValue format int32", 2026-08-07), and
+        // .all invites the same broken E5 path in-process. Pin the GPU until the
+        // ANE crash is root-caused; Stage 5 flips this when it can prove residency.
+        config.computeUnits = .cpuAndGPU
 
         func load(_ base: String) throws -> MLModel {
             let package = modelsDir.appendingPathComponent("\(base)\(suffix).mlpackage")
             guard FileManager.default.fileExists(atPath: package.path) else {
                 throw EvalError.engineUnavailable("missing \(package.lastPathComponent) — run tools/convert/export.py")
             }
-            let compiled = try MLModel.compileModel(at: package)
-            return try MLModel(contentsOf: compiled, configuration: config)
+            return try MLModel(contentsOf: Self.compiledURL(for: package), configuration: config)
         }
 
         let enc = try load("ParakeetEncoder")
@@ -116,7 +139,9 @@ public final class ParakeetEngine: EvalEngine {
         lengthArray[0] = NSNumber(value: frontend.validFrames(for: samples.count))
 
         // --- encoder ---
+        let encClock = ContinuousClock.now
         let encOut = try Self.predictSync(encoder, ["mel": melArray, "length": lengthArray])
+        let encoderMs = Int((ContinuousClock.now - encClock) / .milliseconds(1))
         let encodedArray = encOut.featureValue(for: "encoded")!.multiArrayValue!   // [1, T', D]
         let frames = encOut.featureValue(for: "encoded_len")!.multiArrayValue![0].intValue
         let dModel = encodedArray.shape[2].intValue
@@ -178,6 +203,10 @@ public final class ParakeetEngine: EvalEngine {
             }
         }
 
+        if ProcessInfo.processInfo.environment["MIMI_PROFILE"] != nil {
+            let total = Int((ContinuousClock.now - encClock) / .milliseconds(1))
+            print("    profile: enc \(encoderMs)ms, decode \(total - encoderMs)ms (\(frames) frames, \(ids.count) tokens)")
+        }
         return ids.map { tokens[$0] }.joined()
             .replacingOccurrences(of: "\u{2581}", with: " ")
             .trimmingCharacters(in: .whitespaces)
