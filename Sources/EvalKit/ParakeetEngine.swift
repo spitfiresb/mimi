@@ -128,6 +128,18 @@ public final class ParakeetEngine: EvalEngine {
     private func transcribeChunk(
         _ samples: [Float], decoder: MLModel, joint: MLModel, meta: Meta
     ) throws -> String {
+        // Every prediction returns autoreleased IOSurface-backed outputs; a CLI
+        // has no draining pool, so 300-odd utterances exhaust E5 buffer
+        // allocation ("Failed to allocate E5 buffer object", 2026-08-07).
+        // Drain per chunk.
+        try autoreleasepool {
+            try transcribeChunkInner(samples, decoder: decoder, joint: joint, meta: meta)
+        }
+    }
+
+    private func transcribeChunkInner(
+        _ samples: [Float], decoder: MLModel, joint: MLModel, meta: Meta
+    ) throws -> String {
 
         // --- mel + pad to enumerated window ---
         let mel = frontend.mel(of: samples)
