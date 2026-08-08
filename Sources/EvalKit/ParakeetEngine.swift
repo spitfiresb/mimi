@@ -21,15 +21,18 @@ public final class ParakeetEngine: EvalEngine {
     }
 
     private let lock = NSLock()
-    private nonisolated(unsafe) var encoder: MLModel?
+    private nonisolated(unsafe) var encoders: [Int: MLModel] = [:]
     private nonisolated(unsafe) var decoder: MLModel?
     private nonisolated(unsafe) var joint: MLModel?
     private nonisolated(unsafe) var meta: Meta?
     private nonisolated(unsafe) var tokens: [String] = []
     private let suffix: String
 
-    /// The encoder ships with enumerated shapes (a flexible axis crashes the
-    /// BNNS compiler); pad mels up to the smallest allowed window.
+    /// One encoder package per fixed window (ParakeetEncoderW301 etc.); pad
+    /// mels up to the smallest window that fits. Fixed shapes are what let the
+    /// encoder on the ANE at all — EnumeratedShapes and RangeDim exports both
+    /// crash the E5/BNNS compiler (2026-08-07). Encoders load lazily: each is
+    /// ~600MB of weights and this is an 8GB machine.
     static let windows = [301, 1501, 3001]
 
     public init(modelsDir: URL, int8: Bool = true) {
@@ -60,25 +63,31 @@ public final class ParakeetEngine: EvalEngine {
         return cached
     }
 
-    public func prepare() async throws {
+    private func load(_ base: String, computeUnits: MLComputeUnits) throws -> MLModel {
         let config = MLModelConfiguration()
-        // CPU_AND_NE still segfaults in BNNS E5 init even with enumerated shapes
-        // ("Cannot retrieve vector from IRValue format int32", 2026-08-07), and
-        // .all invites the same broken E5 path in-process. Pin the GPU until the
-        // ANE crash is root-caused; Stage 5 flips this when it can prove residency.
-        config.computeUnits = .cpuAndGPU
-
-        func load(_ base: String) throws -> MLModel {
-            let package = modelsDir.appendingPathComponent("\(base)\(suffix).mlpackage")
-            guard FileManager.default.fileExists(atPath: package.path) else {
-                throw EvalError.engineUnavailable("missing \(package.lastPathComponent) — run tools/convert/export.py")
-            }
-            return try MLModel(contentsOf: Self.compiledURL(for: package), configuration: config)
+        config.computeUnits = computeUnits
+        let package = modelsDir.appendingPathComponent("\(base)\(suffix).mlpackage")
+        guard FileManager.default.fileExists(atPath: package.path) else {
+            throw EvalError.engineUnavailable("missing \(package.lastPathComponent) — run tools/convert/export.py")
         }
+        return try MLModel(contentsOf: Self.compiledURL(for: package), configuration: config)
+    }
 
-        let enc = try load("ParakeetEncoder")
-        let dec = try load("ParakeetDecoder")
-        let jnt = try load("ParakeetJoint")
+    /// Fixed-window encoders run on the ANE (36ms for the 15s window vs 2.2s
+    /// on GPU). Loaded on first use for their window, then kept.
+    private func encoder(for window: Int) throws -> MLModel {
+        if let cached = lock.withLock({ encoders[window] }) { return cached }
+        let model = try load("ParakeetEncoderW\(window)", computeUnits: .cpuAndNeuralEngine)
+        lock.withLock { encoders[window] = model }
+        return model
+    }
+
+    public func prepare() async throws {
+        // Decoder and joint stay off the ANE: the decode loop is per-token
+        // round trips where dispatch overhead dominates, and it already
+        // measures <300ms per utterance.
+        let dec = try load("ParakeetDecoder", computeUnits: .cpuAndGPU)
+        let jnt = try load("ParakeetJoint", computeUnits: .cpuAndGPU)
         let m = try JSONDecoder().decode(
             Meta.self,
             from: Data(contentsOf: modelsDir.appendingPathComponent("parakeet-meta.json"))
@@ -88,13 +97,13 @@ public final class ParakeetEngine: EvalEngine {
             .map(String.init)
 
         lock.withLock {
-            encoder = enc; decoder = dec; joint = jnt; meta = m; tokens = toks
+            decoder = dec; joint = jnt; meta = m; tokens = toks
         }
     }
 
     public func transcribe(_ audioURL: URL) async throws -> (text: String, processing: Duration) {
-        let (encoder, decoder, joint, meta) = lock.withLock { (self.encoder, self.decoder, self.joint, self.meta) }
-        guard let encoder, let decoder, let joint, let meta else {
+        let (decoder, joint, meta) = lock.withLock { (self.decoder, self.joint, self.meta) }
+        guard let decoder, let joint, let meta else {
             throw EvalError.engineUnavailable("prepare() not called")
         }
 
@@ -111,13 +120,13 @@ public final class ParakeetEngine: EvalEngine {
         var texts: [String] = []
         for chunkStart in stride(from: 0, to: allSamples.count, by: maxChunk) {
             let samples = Array(allSamples[chunkStart..<min(chunkStart + maxChunk, allSamples.count)])
-            texts.append(try transcribeChunk(samples, encoder: encoder, decoder: decoder, joint: joint, meta: meta))
+            texts.append(try transcribeChunk(samples, decoder: decoder, joint: joint, meta: meta))
         }
         return (texts.joined(separator: " ").trimmingCharacters(in: .whitespaces), clock.now - start)
     }
 
     private func transcribeChunk(
-        _ samples: [Float], encoder: MLModel, decoder: MLModel, joint: MLModel, meta: Meta
+        _ samples: [Float], decoder: MLModel, joint: MLModel, meta: Meta
     ) throws -> String {
 
         // --- mel + pad to enumerated window ---
@@ -140,7 +149,7 @@ public final class ParakeetEngine: EvalEngine {
 
         // --- encoder ---
         let encClock = ContinuousClock.now
-        let encOut = try Self.predictSync(encoder, ["mel": melArray, "length": lengthArray])
+        let encOut = try Self.predictSync(encoder(for: window), ["mel": melArray, "length": lengthArray])
         let encoderMs = Int((ContinuousClock.now - encClock) / .milliseconds(1))
         let encodedArray = encOut.featureValue(for: "encoded")!.multiArrayValue!   // [1, T', D]
         let frames = encOut.featureValue(for: "encoded_len")!.multiArrayValue![0].intValue

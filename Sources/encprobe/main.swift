@@ -24,11 +24,14 @@ let ptr = melArray.dataPointer.bindMemory(to: Float.self, capacity: 128 * 1501)
 for i in 0..<(128 * 1501) { ptr[i] = Float.random(in: -1...1) }
 let len = try MLMultiArray(shape: [1], dataType: .int32); len[0] = 1490
 
+var inputs: [String: Any] = ["mel": melArray]
+if m.modelDescription.inputDescriptionsByName["length"] != nil { inputs["length"] = len }
+
 let runs = CommandLine.arguments.count > 2 ? Int(CommandLine.arguments[2]) ?? 8 : 8
 var times: [Int] = []
 for run in 0..<runs {
     let t0 = ContinuousClock.now
-    _ = try m.prediction(from: MLDictionaryFeatureProvider(dictionary: ["mel": melArray, "length": len]))
+    _ = try m.prediction(from: MLDictionaryFeatureProvider(dictionary: inputs))
     let ms = Int((ContinuousClock.now - t0) / .milliseconds(1))
     times.append(ms)
     print("run \(run): \(ms)ms")
