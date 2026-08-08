@@ -176,12 +176,20 @@ The risky stage. Conversion is where this dies if it dies.
 
 The clause everyone else fabricates. We measure it.
 
-- [ ] `computeUnits = .cpuAndNeuralEngine`; verify no silent CPU fallback via
-      Instruments' Core ML/ANE trace
+- [x] `computeUnits = .cpuAndNeuralEngine` — required root-causing a hard
+      E5/BNNS segfault: RangeDim *and* EnumeratedShapes encoder exports both
+      crash the ANE compiler; only single fixed-shape windows load. The engine
+      now ships one encoder package per window (301/1501/3001), lazily loaded.
+      Encoder on-ANE: 36ms per 15s window vs 2.2s on GPU (~65×).
+      Instruments-level residency trace still pending; the timing delta is the
+      interim evidence.
 - [ ] `powermetrics --samplers ane_power` capture during a harness run — ANE draw
-      while decoding is the receipt
-- [ ] Measure RTF on-ANE across the eval set; this number replaces the 0.2×
-      placeholder in the press release
+      while decoding is the receipt (needs sudo; not yet captured)
+- [x] Measure RTF on-ANE across the eval set — **measured 2026-08-07, full
+      2,620 utterances: RTF 0.008× (5.4h in 2.6 min), WER 1.92%** (805 sub /
+      91 ins / 113 del). Beats the SpeechTranscriber baseline on both axes
+      (2.34% WER, 0.028× RTF) under identical scoring. 0.008× replaces the
+      0.2× placeholder.
 - [ ] Op-level audit: which layers fell off the ANE and why (the usual suspects:
       unsupported ops, dynamic shapes); fix what's fixable
 - [ ] Power/thermal comparison: ANE vs CPU-only on the same workload

@@ -21,15 +21,18 @@ public final class ParakeetEngine: EvalEngine {
     }
 
     private let lock = NSLock()
-    private nonisolated(unsafe) var encoder: MLModel?
+    private nonisolated(unsafe) var encoders: [Int: MLModel] = [:]
     private nonisolated(unsafe) var decoder: MLModel?
     private nonisolated(unsafe) var joint: MLModel?
     private nonisolated(unsafe) var meta: Meta?
     private nonisolated(unsafe) var tokens: [String] = []
     private let suffix: String
 
-    /// The encoder ships with enumerated shapes (a flexible axis crashes the
-    /// BNNS compiler); pad mels up to the smallest allowed window.
+    /// One encoder package per fixed window (ParakeetEncoderW301 etc.); pad
+    /// mels up to the smallest window that fits. Fixed shapes are what let the
+    /// encoder on the ANE at all — EnumeratedShapes and RangeDim exports both
+    /// crash the E5/BNNS compiler (2026-08-07). Encoders load lazily: each is
+    /// ~600MB of weights and this is an 8GB machine.
     static let windows = [301, 1501, 3001]
 
     public init(modelsDir: URL, int8: Bool = true) {
@@ -38,24 +41,53 @@ public final class ParakeetEngine: EvalEngine {
         self.name = int8 ? "Parakeet-int8" : "Parakeet-fp16"
     }
 
-    public func prepare() async throws {
-        let config = MLModelConfiguration()
-        // CPU_AND_NE segfaults in BNNS graph compile (see Stage 4a); .all lets
-        // unsupported segments fall to GPU. Stage 5 audits actual ANE residency.
-        config.computeUnits = .all
-
-        func load(_ base: String) throws -> MLModel {
-            let package = modelsDir.appendingPathComponent("\(base)\(suffix).mlpackage")
-            guard FileManager.default.fileExists(atPath: package.path) else {
-                throw EvalError.engineUnavailable("missing \(package.lastPathComponent) — run tools/convert/export.py")
-            }
-            let compiled = try MLModel.compileModel(at: package)
-            return try MLModel(contentsOf: compiled, configuration: config)
+    /// `MLModel.compileModel` writes a ~1.2GB `.mlmodelc` into the system temp
+    /// directory on every call and never cleans it up (38GB of orphans found on
+    /// 2026-08-07). Compile once into a `compiled/` cache beside the packages,
+    /// invalidated by the package's modification date.
+    public static func compiledURL(for package: URL) throws -> URL {
+        let fm = FileManager.default
+        let cacheDir = package.deletingLastPathComponent().appendingPathComponent("compiled")
+        let cached = cacheDir.appendingPathComponent(
+            package.deletingPathExtension().lastPathComponent + ".mlmodelc")
+        let packageDate = try fm.attributesOfItem(atPath: package.path)[.modificationDate] as? Date
+        if fm.fileExists(atPath: cached.path),
+           let cachedDate = try? fm.attributesOfItem(atPath: cached.path)[.modificationDate] as? Date,
+           let packageDate, cachedDate > packageDate {
+            return cached
         }
+        try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        let temp = try MLModel.compileModel(at: package)
+        if fm.fileExists(atPath: cached.path) { try fm.removeItem(at: cached) }
+        try fm.moveItem(at: temp, to: cached)
+        return cached
+    }
 
-        let enc = try load("ParakeetEncoder")
-        let dec = try load("ParakeetDecoder")
-        let jnt = try load("ParakeetJoint")
+    private func load(_ base: String, computeUnits: MLComputeUnits) throws -> MLModel {
+        let config = MLModelConfiguration()
+        config.computeUnits = computeUnits
+        let package = modelsDir.appendingPathComponent("\(base)\(suffix).mlpackage")
+        guard FileManager.default.fileExists(atPath: package.path) else {
+            throw EvalError.engineUnavailable("missing \(package.lastPathComponent) — run tools/convert/export.py")
+        }
+        return try MLModel(contentsOf: Self.compiledURL(for: package), configuration: config)
+    }
+
+    /// Fixed-window encoders run on the ANE (36ms for the 15s window vs 2.2s
+    /// on GPU). Loaded on first use for their window, then kept.
+    private func encoder(for window: Int) throws -> MLModel {
+        if let cached = lock.withLock({ encoders[window] }) { return cached }
+        let model = try load("ParakeetEncoderW\(window)", computeUnits: .cpuAndNeuralEngine)
+        lock.withLock { encoders[window] = model }
+        return model
+    }
+
+    public func prepare() async throws {
+        // Decoder and joint stay off the ANE: the decode loop is per-token
+        // round trips where dispatch overhead dominates, and it already
+        // measures <300ms per utterance.
+        let dec = try load("ParakeetDecoder", computeUnits: .cpuAndGPU)
+        let jnt = try load("ParakeetJoint", computeUnits: .cpuAndGPU)
         let m = try JSONDecoder().decode(
             Meta.self,
             from: Data(contentsOf: modelsDir.appendingPathComponent("parakeet-meta.json"))
@@ -65,13 +97,13 @@ public final class ParakeetEngine: EvalEngine {
             .map(String.init)
 
         lock.withLock {
-            encoder = enc; decoder = dec; joint = jnt; meta = m; tokens = toks
+            decoder = dec; joint = jnt; meta = m; tokens = toks
         }
     }
 
     public func transcribe(_ audioURL: URL) async throws -> (text: String, processing: Duration) {
-        let (encoder, decoder, joint, meta) = lock.withLock { (self.encoder, self.decoder, self.joint, self.meta) }
-        guard let encoder, let decoder, let joint, let meta else {
+        let (decoder, joint, meta) = lock.withLock { (self.decoder, self.joint, self.meta) }
+        guard let decoder, let joint, let meta else {
             throw EvalError.engineUnavailable("prepare() not called")
         }
 
@@ -88,13 +120,25 @@ public final class ParakeetEngine: EvalEngine {
         var texts: [String] = []
         for chunkStart in stride(from: 0, to: allSamples.count, by: maxChunk) {
             let samples = Array(allSamples[chunkStart..<min(chunkStart + maxChunk, allSamples.count)])
-            texts.append(try transcribeChunk(samples, encoder: encoder, decoder: decoder, joint: joint, meta: meta))
+            texts.append(try transcribeChunk(samples, decoder: decoder, joint: joint, meta: meta))
         }
         return (texts.joined(separator: " ").trimmingCharacters(in: .whitespaces), clock.now - start)
     }
 
     private func transcribeChunk(
-        _ samples: [Float], encoder: MLModel, decoder: MLModel, joint: MLModel, meta: Meta
+        _ samples: [Float], decoder: MLModel, joint: MLModel, meta: Meta
+    ) throws -> String {
+        // Every prediction returns autoreleased IOSurface-backed outputs; a CLI
+        // has no draining pool, so 300-odd utterances exhaust E5 buffer
+        // allocation ("Failed to allocate E5 buffer object", 2026-08-07).
+        // Drain per chunk.
+        try autoreleasepool {
+            try transcribeChunkInner(samples, decoder: decoder, joint: joint, meta: meta)
+        }
+    }
+
+    private func transcribeChunkInner(
+        _ samples: [Float], decoder: MLModel, joint: MLModel, meta: Meta
     ) throws -> String {
 
         // --- mel + pad to enumerated window ---
@@ -116,7 +160,9 @@ public final class ParakeetEngine: EvalEngine {
         lengthArray[0] = NSNumber(value: frontend.validFrames(for: samples.count))
 
         // --- encoder ---
-        let encOut = try Self.predictSync(encoder, ["mel": melArray, "length": lengthArray])
+        let encClock = ContinuousClock.now
+        let encOut = try Self.predictSync(encoder(for: window), ["mel": melArray, "length": lengthArray])
+        let encoderMs = Int((ContinuousClock.now - encClock) / .milliseconds(1))
         let encodedArray = encOut.featureValue(for: "encoded")!.multiArrayValue!   // [1, T', D]
         let frames = encOut.featureValue(for: "encoded_len")!.multiArrayValue![0].intValue
         let dModel = encodedArray.shape[2].intValue
@@ -178,6 +224,10 @@ public final class ParakeetEngine: EvalEngine {
             }
         }
 
+        if ProcessInfo.processInfo.environment["MIMI_PROFILE"] != nil {
+            let total = Int((ContinuousClock.now - encClock) / .milliseconds(1))
+            print("    profile: enc \(encoderMs)ms, decode \(total - encoderMs)ms (\(frames) frames, \(ids.count) tokens)")
+        }
         return ids.map { tokens[$0] }.joined()
             .replacingOccurrences(of: "\u{2581}", with: " ")
             .trimmingCharacters(in: .whitespaces)

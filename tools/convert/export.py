@@ -25,6 +25,26 @@ import nemo.collections.asr as nemo_asr
 
 OUT = Path(__file__).parent / "models"
 
+# coremltools' torch _cast does `dtype(x.val)` on const-folded casts; with a
+# fully static encoder shape the fold produces 1-element arrays, and
+# numpy >= 1.25 raises on int(np.array([x])). Scalarize before casting.
+from coremltools.converters.mil.frontend.torch import ops as _torch_ops
+
+_orig_cast = _torch_ops._cast
+
+def _cast_scalarize(context, node, dtype, dtype_name):
+    inputs = _torch_ops._get_inputs(context, node, expected=1)
+    x = inputs[0]
+    if x.can_be_folded_to_const():
+        val = np.asarray(x.val)
+        if val.ndim > 0 and val.size == 1:
+            res = _torch_ops.mb.const(val=dtype(val.item()), name=node.name)
+            context.add(res, node.name)
+            return
+    _orig_cast(context, node, dtype, dtype_name)
+
+_torch_ops._cast = _cast_scalarize
+
 
 class EncoderWrapper(torch.nn.Module):
     """mel [1, 80, T] + length [1] -> encoded [1, T', D] (time-major for the
@@ -35,6 +55,23 @@ class EncoderWrapper(torch.nn.Module):
         self.encoder = encoder
 
     def forward(self, mel, length):
+        encoded, encoded_len = self.encoder(audio_signal=mel, length=length)
+        return encoded.transpose(1, 2), encoded_len
+
+
+class EncoderNoLengthWrapper(torch.nn.Module):
+    """mel [1, 80, T] -> encoded [1, T', D]. No int32 length input: the E5/ANE
+    compiler dies on it ("Cannot retrieve vector from IRValue format int32",
+    2026-08-07), so this variant derives length from the mel shape in-graph.
+    The Swift side pads to an enumerated window, so length == T is what the
+    engine passes today anyway; validity trimming stays in Swift."""
+
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, mel):
+        length = torch._shape_as_tensor(mel)[2].reshape(1).to(torch.int32)
         encoded, encoded_len = self.encoder(audio_signal=mel, length=length)
         return encoded.transpose(1, 2), encoded_len
 
@@ -77,18 +114,53 @@ def convert(model, args):
     compute = {"fp16": ct.precision.FLOAT16, "int8": ct.precision.FLOAT16}[args.precision]
     suffix = "" if args.precision == "fp16" else "-int8"
 
-    # --- encoder: flexible time axis ---
-    enc = EncoderWrapper(model.encoder).eval()
-    T = 1501  # 15s of 10ms mel frames as the trace example; RangeDim keeps it flexible
+    # --- encoder: enumerated time axis ---
+    # Three fixed windows (3s / 15s / 30s), matching ParakeetEngine.windows.
+    # A RangeDim axis produces an E5 program with no FlexibleShapeInformation:
+    # the ANE can't run it (BNNS crashes outright on .cpuOnly / .cpuAndNeuralEngine)
+    # and every previously unseen shape pays a 40-90s runtime re-specialization.
+    # Enumerated shapes are precompiled per-variant and ANE-eligible.
+    T = 1501  # 15s of 10ms mel frames as the trace example
     mel = torch.randn(1, mel_dim, T)
     length = torch.tensor([T], dtype=torch.int32)
-    traced = torch.jit.trace(enc, (mel, length))
+    enc_shapes = ct.EnumeratedShapes(
+        shapes=[(1, mel_dim, t) for t in (301, 1501, 3001)], default=(1, mel_dim, T)
+    )
+    if args.window:
+        # Single fixed shape, matching FluidInference's working ANE recipe —
+        # their Parakeet encoder ships one fixed 15s window, no EnumeratedShapes.
+        # (EnumeratedShapes and RangeDim both crash the E5/ANE compiler in BNNS.)
+        # Combine with --no-length to derive length in-graph instead of masking.
+        mel_w = torch.randn(1, mel_dim, args.window)
+        if args.no_length:
+            enc = EncoderNoLengthWrapper(model.encoder).eval()
+            traced = torch.jit.trace(enc, (mel_w,))
+            enc_inputs = [ct.TensorType(name="mel", shape=(1, mel_dim, args.window), dtype=np.float32)]
+            enc_name = f"ParakeetEncoderW{args.window}NL"
+        else:
+            enc = EncoderWrapper(model.encoder).eval()
+            traced = torch.jit.trace(enc, (mel_w, torch.tensor([args.window], dtype=torch.int32)))
+            enc_inputs = [
+                ct.TensorType(name="mel", shape=(1, mel_dim, args.window), dtype=np.float32),
+                ct.TensorType(name="length", shape=(1,), dtype=np.int32),
+            ]
+            enc_name = f"ParakeetEncoderW{args.window}"
+    elif args.no_length:
+        enc = EncoderNoLengthWrapper(model.encoder).eval()
+        traced = torch.jit.trace(enc, (mel,))
+        enc_inputs = [ct.TensorType(name="mel", shape=enc_shapes, dtype=np.float32)]
+        enc_name = "ParakeetEncoderNL"
+    else:
+        enc = EncoderWrapper(model.encoder).eval()
+        traced = torch.jit.trace(enc, (mel, length))
+        enc_inputs = [
+            ct.TensorType(name="mel", shape=enc_shapes, dtype=np.float32),
+            ct.TensorType(name="length", shape=(1,), dtype=np.int32),
+        ]
+        enc_name = "ParakeetEncoder"
     mlmodel = ct.convert(
         traced,
-        inputs=[
-            ct.TensorType(name="mel", shape=(1, mel_dim, ct.RangeDim(1, 3001, default=T)), dtype=np.float32),
-            ct.TensorType(name="length", shape=(1,), dtype=np.int32),
-        ],
+        inputs=enc_inputs,
         outputs=[ct.TensorType(name="encoded"), ct.TensorType(name="encoded_len")],
         compute_precision=compute,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
@@ -97,8 +169,10 @@ def convert(model, args):
     )
     if args.precision == "int8":
         mlmodel = quantize_int8(mlmodel)
-    mlmodel.save(str(OUT / f"ParakeetEncoder{suffix}.mlpackage"))
+    mlmodel.save(str(OUT / f"{enc_name}{suffix}.mlpackage"))
     print("encoder saved")
+    if args.only == "encoder":
+        return
 
     # --- decoder step ---
     dec = DecoderWrapper(model.decoder).eval()
@@ -188,6 +262,11 @@ def quantize_int8(mlmodel):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--precision", choices=["fp16", "int8"], default="fp16")
+    parser.add_argument("--only", choices=["encoder", "all"], default="all")
+    parser.add_argument("--no-length", action="store_true",
+                        help="export the encoder without the int32 length input (ANE experiment)")
+    parser.add_argument("--window", type=int, default=None,
+                        help="export the encoder with a single fixed mel-frame window (ANE experiment)")
     args = parser.parse_args()
 
     model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
