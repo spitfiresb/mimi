@@ -15,11 +15,25 @@ struct TranscriptEntry: Codable {
     var locale: String?
 
     /// Where the text was headed — the formatting pass will eventually key off this.
+    /// Captured at key press.
     var appBundleID: String?
     var appName: String?
 
+    /// Whatever was frontmost at the moment ⌘V was posted. Differs from
+    /// `appName` when focus moved during the wait, which is the first thing to
+    /// rule out when a dictation transcribes correctly and then never lands.
+    var pasteTarget: String?
+
     /// What the ASR produced, verbatim.
     var raw: String
+
+    /// Which engine produced `raw`: "parakeet-int8" or "apple" (fallback).
+    /// Absent on entries logged before the Stage 5 default-engine swap.
+    var engine: String?
+
+    /// Apple's transcript of the same audio, kept when Parakeet produced `raw`
+    /// — every dictation becomes a free A/B data point.
+    var appleRaw: String?
 
     /// Per-result recognition detail: confidence spans and the n-best
     /// alternatives the recognizer considered. Collected to answer one question —
@@ -33,6 +47,28 @@ struct TranscriptEntry: Codable {
     /// this says which stage to blame.
     var timings: Timings?
 
+    /// Capture-side health. A dictation that transcribes to nothing has two
+    /// very different causes — the mic fed us silence, or the engines failed on
+    /// good audio — and only the recording's level can tell them apart.
+    var audio: AudioHealth?
+
+    struct AudioHealth: Codable {
+        /// The input device the tap was reading from.
+        var device: String?
+        /// That device's nominal hardware sample rate at capture time.
+        var deviceRate: Double?
+        /// The rate the tap believed it was receiving. Disagreement with
+        /// `deviceRate` means the input node's cached format went stale across
+        /// a device pin or route change — the leading suspect when a recording
+        /// comes back as garble.
+        var tapRate: Double?
+        /// Peak absolute sample of the 16kHz recording, 0–1. Spoken audio
+        /// peaks well above 0.05; ~0 means the mic fed us silence.
+        var peak: Float?
+        /// Seconds of audio actually captured.
+        var seconds: Double?
+    }
+
     struct Timings: Codable {
         /// finalizeAndFinishThroughEndOfInput + collecting results.
         var finalizeMs: Int
@@ -42,6 +78,8 @@ struct TranscriptEntry: Codable {
         var settleMs: Int
         /// Waiting for modifiers to clear + posting ⌘V.
         var insertMs: Int
+        /// The Parakeet transcription of the buffered audio (0 = not run).
+        var parakeetMs: Int?
         /// Keypress → session accepting audio (makeSession + context + start).
         var startupMs: Int?
         /// Keypress → first live preview text on screen.

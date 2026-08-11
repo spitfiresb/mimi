@@ -7,6 +7,9 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "Mimi",
+            // EvalKit for ParakeetEngine — the harness-proven engine is the
+            // app's default ASR as of Stage 5 (WER 1.92% vs 2.34%, on-ANE).
+            dependencies: ["EvalKit"],
             path: "Sources/Mimi",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

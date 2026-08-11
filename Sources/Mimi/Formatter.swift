@@ -182,6 +182,7 @@ actor FormatPipeline {
     private var pending = ""
     private var output = ""
     private var processing: Task<Void, Never>?
+    private var cancelled = false
 
     init(formatter: Formatter, onProgress: @escaping @Sendable (String) -> Void) {
         self.formatter = formatter
@@ -206,14 +207,28 @@ actor FormatPipeline {
         if !parts.isEmpty { schedule(parts) }
     }
 
-    func finish() async -> String {
+    /// The cleaned utterance, or nil if formatting was abandoned.
+    ///
+    /// Nil rather than the partial output on purpose: `output` holds only the
+    /// sentences cleaned so far, and pasting half a dictation as though it were
+    /// whole is a far worse failure than pasting it unformatted.
+    func finish() async -> String? {
         let tail = pending
         pending = ""
         if !tail.trimmingCharacters(in: .whitespaces).isEmpty {
             schedule([tail])
         }
         await processing?.value
+        if cancelled { return nil }
         return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Stop formatting and give up on the result. Each sentence is a separate
+    /// model round-trip, so the loop notices between sentences — cancelling the
+    /// task alone would not, since `respond` is already in flight.
+    func cancel() {
+        cancelled = true
+        processing?.cancel()
     }
 
     private func schedule(_ sentences: [String]) {
@@ -222,6 +237,7 @@ actor FormatPipeline {
         processing = Task {
             await previous?.value
             for sentence in sentences {
+                if cancelled { return }
                 let cleaned = await formatter.cleanSentence(
                     sentence, suspectTokens: suspectSnapshot, session: session
                 )
