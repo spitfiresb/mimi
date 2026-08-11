@@ -119,7 +119,11 @@ final class OverlayPanel {
     func waiting() {
         stopPulse()
         let current = label.attributedStringValue.string
-        render(committed: "", volatile: current, animated: true)
+        // If no preview ever arrived, "Listening…" is still on screen — but the
+        // recording is over, and a stall past this point would wedge the panel
+        // on a state the app already left. Say what's actually happening.
+        let text = current == "Listening…" ? "Transcribing…" : current
+        render(committed: "", volatile: text, animated: true)
     }
 
     /// The cleaned sentence replaces the raw one, holds a beat so the change

@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import EvalKit
 import Speech
 
 @MainActor
@@ -10,11 +11,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Stored inverted so formatting defaults to on without a registration dance.
     private static let verbatimKey = "verbatimMode"
+
+    /// How long the formatting pass may hold the paste. Short dictations finish
+    /// in ~40ms because routing skips them entirely; only multi-sentence takes
+    /// reach the model, and those are the ones that ran to 6.4s and 11.2s. Raise
+    /// it to favour cleanup, lower it to favour landing the text.
+    private static let formatDeadlineSeconds = 2.5
+
+    /// How long the key release will wait for session startup before giving the
+    /// UI back. Generous — startup normally lands in tens of milliseconds, and
+    /// abandoning it costs the whole utterance — but finite, because the
+    /// alternative is an overlay wedged on "Listening" forever.
+    private static let sessionStartDeadlineSeconds = 8.0
+
+    /// Ceiling on a single dictation. Not a feature — a floor under the worst
+    /// case, so a lost key-up costs one utterance instead of the whole session.
+    private static let maxRecordingSeconds = 120.0
+
+    /// Force-ends a recording that outlives `maxRecordingSeconds`.
+    private var watchdog: Task<Void, Never>?
     private let engine = SpeechEngine()
     private let audio = AudioCapture()
     private let hotkey = HotkeyMonitor()
     private let overlay = OverlayPanel()
     private let formatter = Formatter()
+
+    /// The Stage 5 default: Parakeet-int8 on the Neural Engine transcribes the
+    /// buffered session audio at release (WER 1.92% vs SpeechTranscriber's
+    /// 2.34% on the harness). Apple's engine still runs live for the preview
+    /// overlay and remains the fallback whenever Parakeet is unavailable or
+    /// errors — principle 3, both arms stay wired.
+    private let parakeet = ParakeetEngine(modelsDir: AppDelegate.parakeetModelsDir())
+    private var parakeetReady = false
+
+    /// Dev-machine layout until 'ship it' bundles weights: an override via
+    /// `defaults write`, else the repo checkout this binary was built from.
+    private static func parakeetModelsDir() -> URL {
+        if let override = UserDefaults.standard.string(forKey: "ParakeetModelsDir") {
+            return URL(fileURLWithPath: override)
+        }
+        return URL(fileURLWithPath: #filePath)  // Sources/Mimi/AppDelegate.swift
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("tools/convert/models")
+    }
 
     /// Session startup is async; the user can release the key before it lands.
     /// endRecording awaits this task instead of reading a `session` var that may
@@ -159,6 +198,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // warm is ~0.5s. Fire-and-forget — dictation must not wait on it.
         Task { await formatter.prewarm() }
 
+        // Load Parakeet off the critical path. If anything fails (missing
+        // packages, bad models dir) the app quietly stays on Apple's engine.
+        Task { [parakeet] in
+            do {
+                try await parakeet.prepare()
+                await Task.detached(priority: .utility) { parakeet.warmEncoders() }.value
+                await MainActor.run { self.parakeetReady = true }
+            } catch {
+                // Fallback path: parakeetReady stays false, Apple transcribes.
+            }
+        }
+
         hotkey.onPress = { [weak self] in Task { @MainActor in await self?.beginRecording() } }
         hotkey.onRelease = { [weak self] in Task { @MainActor in await self?.endRecording() } }
 
@@ -186,6 +237,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setState(symbol: "mic.fill", status: "Listening…")
         overlay.show()
 
+        // Last line of defence against a recording that never ends. Every known
+        // route to a wedged "Listening" panel is now handled individually, but
+        // they all reduce to the same thing — a key-up that never arrives — and
+        // the user has no way out of it when it happens. A dictation this long
+        // is not a real one, so ending it costs nothing and the transcript of
+        // whatever was captured still lands.
+        watchdog?.cancel()
+        watchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.maxRecordingSeconds))
+            guard !Task.isCancelled else { return }
+            await self?.endRecording()
+        }
+
         // Belt to the wake notification's suspenders — if anything else stopped
         // the engine, revive it before capturing.
         audio.ensureRunning()
@@ -200,22 +264,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // press.
         let audioEpoch = pressAt - .milliseconds(500)
 
-        // Clean sentences while the user is still speaking; nil in verbatim mode.
-        let pipeline: FormatPipeline?
-        if UserDefaults.standard.bool(forKey: Self.verbatimKey) {
-            pipeline = nil
-        } else {
-            pipeline = FormatPipeline(formatter: formatter) { [weak self] partial in
-                Task { @MainActor in
-                    // Only surface cleaned text once the user has released —
-                    // during speech the overlay belongs to the live preview.
-                    guard let self, !self.isRecording else { return }
-                    self.overlay.stream(partial)
-                }
-            }
-        }
-        self.pipeline = pipeline
-
+        // Formatting now happens at release on whichever engine's text wins
+        // (Parakeet's arrives all at once, so there's nothing to pre-clean
+        // mid-speech; Apple's chunked-feed optimization went with it).
         startTask = Task { [weak self] in
             guard let self else { return nil }
             do {
@@ -223,9 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try await session.start(
                     stream,
                     audioEpoch: audioEpoch,
-                    onFinalResult: { text, spans in
-                        await pipeline?.feed(text, spans: spans)
-                    }
+                    onFinalResult: { _, _ in }
                 ) { [weak self] committed, volatile, lagMs in
                     Task { @MainActor in
                         guard let self, self.isRecording else { return }
@@ -260,22 +309,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     private var previewStats = PreviewStats()
-    private var pipeline: FormatPipeline?
 
     private func endRecording() async {
-        guard isRecording else { return }
+        guard isRecording else {
+            // A release with nothing recording means the press and release
+            // transitions raced, or the press was lost. Either way the panel may
+            // be sitting on "Listening" with nothing behind it, so the UI has to
+            // be put back — a stuck panel is indistinguishable from a dead
+            // hotkey, and the user has no way out of it.
+            overlay.hide()
+            setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
+            return
+        }
         isRecording = false
+        watchdog?.cancel()
+        watchdog = nil
         let context = self.context
         self.context = nil
 
         // Wait for startup to land — however brief the press was, there may be
         // buffered audio worth transcribing.
-        let session = await startTask?.value
+        //
+        // Bounded, because this await is the one place a stall is unrecoverable:
+        // `overlay.waiting()` is still below us, so the panel sits on "Listening"
+        // with no path forward and no way for the user to tell a wedged app from
+        // a dead hotkey. Session startup contends with the encoder warm-up and
+        // the system's own speech assets, and on a loaded machine it can take a
+        // very long time (2026-08-11).
+        let pending = startTask
         startTask = nil
+        let session = await Self.abandoning(after: Self.sessionStartDeadlineSeconds) {
+            await pending?.value
+        } ?? nil
 
         guard let session else {
+            pending?.cancel()
             audio.stop()
             overlay.hide()
+            setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
             return
         }
         setState(symbol: "mic", status: "Transcribing…")
@@ -284,98 +355,254 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Finishing the audio stream is what lets finalize() return.
         audio.stop()
 
-        do {
-            let clock = ContinuousClock()
-            var stamp = clock.now
-            func lap() -> Int {
-                let now = clock.now
-                defer { stamp = now }
-                return Int((now - stamp) / .milliseconds(1))
+        // Parakeet transcribes the same audio the analyzer heard, concurrently
+        // with Apple's finalization. ~36ms/15s window on the ANE, so the race
+        // costs nothing; the winner is decided below.
+        let samples = audio.takeRecordedSamples16k()
+        let audioSeconds = Double(samples.count) / MelFrontend.sampleRate
+        let parakeetTask: Task<String?, Never>? = (parakeetReady && !samples.isEmpty)
+            ? Task.detached(priority: .userInitiated) { [parakeet] in
+                try? parakeet.transcribe(samples16k: samples)
             }
+            : nil
 
-            let (text, recognition) = try await Self.withTimeout(seconds: 10) {
-                try await session.finish()
-            }
-            let finalizeMs = lap()
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Capture-side health for the log. A dictation that "heard nothing"
+        // looks identical to one that heard silence; the peak level and the
+        // device/tap rates are what tell those apart afterwards.
+        var peak: Float = 0
+        for sample in samples { peak = max(peak, abs(sample)) }
+        let health = audio.captureHealth()
+        let audioHealth = TranscriptEntry.AudioHealth(
+            device: health.device,
+            deviceRate: health.deviceRate,
+            tapRate: health.tapRate,
+            peak: peak,
+            seconds: audioSeconds
+        )
 
-            if trimmed.isEmpty {
-                overlay.hide()
-            } else {
-                // Most sentences were already cleaned while the user spoke;
-                // this waits only for the tail.
-                var output = trimmed
-                if let pipeline, trimmed.split(separator: " ").count >= Formatter.minimumWords {
-                    let cleaned = await pipeline.finish()
-                    if !cleaned.isEmpty { output = cleaned }
-                }
-                self.pipeline = nil
-                let formatMs = lap()
+        let clock = ContinuousClock()
+        var stamp = clock.now
+        func lap() -> Int {
+            let now = clock.now
+            defer { stamp = now }
+            return Int((now - stamp) / .milliseconds(1))
+        }
 
-                // Let the cleaned sentence land on screen before it lands in
-                // the document — but only when cleanup changed something;
-                // there's nothing to reveal about text the user already watched
-                // arrive verbatim.
-                if output != trimmed {
-                    await overlay.settle(output)
-                }
-                overlay.hide()
-                let settleMs = lap()
-                await TextInserter.insert(output)
-                let insertMs = lap()
+        // Apple's finalization can hang outright: finish() awaits a collector
+        // that only ends when the analyzer delivers end-of-stream, and a broken
+        // session never does. The old withTimeout threw on schedule, but its
+        // task group still waited for the hung child on the way out — so
+        // endRecording suspended here forever, panel up, main thread idle,
+        // nothing on any thread for a sample to even see (2026-08-11, caught
+        // live). Abandon the wait instead, and tear the session down on the way
+        // past: a hung Apple finalize must not cost the dictation when Parakeet
+        // has the same audio.
+        let appleResult = await Self.abandoning(after: 10) {
+            try? await session.finish()
+        }
+        if appleResult == nil { await session.abort() }
+        let finalizeMs = lap()
+        let appleText = appleResult?.text ?? ""
+        let recognition = appleResult?.recognition ?? []
 
-                await log(
-                    trimmed,
-                    formatted: output == trimmed ? nil : output,
-                    recognition: recognition,
-                    timings: .init(
-                        finalizeMs: finalizeMs,
-                        formatMs: formatMs,
-                        settleMs: settleMs,
-                        insertMs: insertMs,
-                        startupMs: previewStats.startupMs,
-                        firstPreviewMs: previewStats.firstPreviewMs,
-                        maxPreviewLagMs: previewStats.maxPreviewLagMs
-                    ),
-                    context: context
-                )
-            }
-            setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
-        } catch {
-            // However finalization failed, the UI must come back — a stuck
-            // "Transcribing…" panel is worse than a lost utterance.
-            await session.abort()
+        // Never spend more wall clock on the decode than the audio itself
+        // lasted. A decode slower than 1x real time is pathology, not
+        // slowness — measured worst case is 0.50x on a 59s dictation — and
+        // Apple's text is already in hand as the fallback. Drop the floor
+        // or the multiplier to trade transcript quality for a faster paste.
+        let parakeetText = await Self.awaitValue(
+            of: parakeetTask, deadline: max(10, audioSeconds))
+        let parakeetMs = lap()
+
+        // Parakeet's text is the default; Apple's is the fallback for an
+        // empty or failed decode. Both are logged either way.
+        let appleTrimmed = appleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parakeetTrimmed = parakeetText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let usedParakeet = !parakeetTrimmed.isEmpty
+        let trimmed = usedParakeet ? parakeetTrimmed : appleTrimmed
+
+        if trimmed.isEmpty {
             overlay.hide()
-            setState(symbol: "mic", status: "Error: \(error.localizedDescription)")
+            // The "it heard nothing" bug report. Logged with the capture
+            // health rather than vanishing without a trace — an empty
+            // dictation with peak ~0 is a mic problem; one with a healthy
+            // peak is an engine problem (2026-08-11).
+            await log(
+                "",
+                formatted: nil,
+                recognition: recognition,
+                timings: .init(
+                    finalizeMs: finalizeMs,
+                    formatMs: 0,
+                    settleMs: 0,
+                    insertMs: 0,
+                    parakeetMs: parakeetMs,
+                    startupMs: previewStats.startupMs,
+                    firstPreviewMs: previewStats.firstPreviewMs,
+                    maxPreviewLagMs: previewStats.maxPreviewLagMs
+                ),
+                audio: audioHealth,
+                context: context
+            )
+        } else {
+            var output = trimmed
+            if !UserDefaults.standard.bool(forKey: Self.verbatimKey),
+               trimmed.split(separator: " ").count >= Formatter.minimumWords {
+                let pipeline = FormatPipeline(formatter: formatter) { [weak self] partial in
+                    Task { @MainActor in
+                        guard let self, !self.isRecording else { return }
+                        self.overlay.stream(partial)
+                    }
+                }
+                await pipeline.feed(trimmed, spans: [])
+
+                // Cleaning is one model round-trip per sentence, run
+                // serially, so the cost scales with how long the user spoke:
+                // 6.4s on a 39s take and 11.2s on a 47s one, both of which
+                // returned the transcript unchanged (2026-08-11). Parakeet
+                // already emits punctuation and casing, so pasting
+                // unformatted is a fine outcome — a paste the user gave up
+                // waiting for is not.
+                // Cancelling between sentences is not enough on its own: a
+                // single `respond()` round trip cannot be interrupted, and
+                // one slow sentence took the pass to 12.1s against a 2.5s
+                // budget (2026-08-11). So the wait is abandoned outright and
+                // the orphan is told to stop on its way out.
+                let cleaned = await Self.abandoning(after: Self.formatDeadlineSeconds) {
+                    await pipeline.finish()
+                }
+                if let cleaned, !cleaned.isEmpty {
+                    output = cleaned
+                } else {
+                    await pipeline.cancel()
+                }
+            }
+            let formatMs = lap()
+
+            // Let the cleaned sentence land on screen before it lands in
+            // the document — but only when cleanup changed something;
+            // there's nothing to reveal about text the user already watched
+            // arrive verbatim.
+            if output != trimmed {
+                await overlay.settle(output)
+            }
+            overlay.hide()
+            let settleMs = lap()
+            let pasteTarget = NSWorkspace.shared.frontmostApplication?.localizedName
+            await TextInserter.insert(output)
+            let insertMs = lap()
+
+            await log(
+                trimmed,
+                engine: usedParakeet ? "parakeet-int8" : "apple",
+                appleRaw: usedParakeet ? appleTrimmed : nil,
+                formatted: output == trimmed ? nil : output,
+                recognition: recognition,
+                timings: .init(
+                    finalizeMs: finalizeMs,
+                    formatMs: formatMs,
+                    settleMs: settleMs,
+                    insertMs: insertMs,
+                    parakeetMs: parakeetMs,
+                    startupMs: previewStats.startupMs,
+                    firstPreviewMs: previewStats.firstPreviewMs,
+                    maxPreviewLagMs: previewStats.maxPreviewLagMs
+                ),
+                pasteTarget: pasteTarget,
+                audio: audioHealth,
+                context: context
+            )
+        }
+        setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
+    }
+
+    /// Timeout for non-throwing async work: returns nil if the deadline passes.
+    /// A hung ANE prediction must not strand the "Transcribing…" panel.
+    /// Await `task`, abandoning it if it outruns `deadline`.
+    ///
+    /// The previous shape raced the work against a sleep inside a task group,
+    /// which is a trap: `withTaskGroup` waits for *every* child before it
+    /// returns, so the timeout fired on schedule, `cancelAll()` couldn't touch
+    /// a detached task running synchronous Core ML work, and the group then sat
+    /// on that work anyway. The deadline neither bounded the wait nor kept the
+    /// answer — a 59s dictation spent 29.2s decoding, discarded the result, and
+    /// pasted Apple's text instead (2026-08-11). Cancelling the task directly
+    /// is what actually stops it; ParakeetEngine checks for it per decode frame.
+    /// Run `job`, but stop waiting after `seconds` and return nil — *without*
+    /// waiting for it to finish.
+    ///
+    /// The distinction matters for work that cannot be interrupted. Awaiting a
+    /// task, in any shape, means inheriting its duration no matter what the
+    /// deadline says; that is what made both `withDeadline` and the first cut of
+    /// the formatting budget useless. Here the loser of the race is simply
+    /// abandoned and finishes into the void.
+    static func abandoning<T: Sendable>(   // internal for DeadlineTests
+        after seconds: Double, _ job: @escaping @Sendable () async -> T?
+    ) async -> T? {
+        let gate = FirstWins<T>()
+        Task { await gate.settle(await job()) }
+        let timer = Task {
+            try? await Task.sleep(for: .seconds(seconds))
+            await gate.settle(nil)
+        }
+        defer { timer.cancel() }
+        return await withCheckedContinuation { continuation in
+            Task { await gate.hold(continuation) }
         }
     }
 
-    /// Race a job against a deadline. Finalization has hung before (sleep/wake
-    /// killed the engine mid-recording); nothing user-visible may await it
-    /// unbounded.
-    private static func withTimeout<T: Sendable>(
-        seconds: Double,
-        _ job: @escaping @Sendable () async throws -> T
-    ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await job() }
-            group.addTask {
-                try await Task.sleep(for: .seconds(seconds))
-                throw MimiError.finalizeTimedOut
+    /// Resumes its continuation exactly once, with whichever racer settled
+    /// first — including when that happens before anyone is waiting.
+    private actor FirstWins<T: Sendable> {
+        private var continuation: CheckedContinuation<T?, Never>?
+        private var settled = false
+        private var stored: T?
+
+        func hold(_ continuation: CheckedContinuation<T?, Never>) {
+            if settled {
+                continuation.resume(returning: stored)
+            } else {
+                self.continuation = continuation
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
         }
+
+        func settle(_ value: T?) {
+            guard !settled else { return }
+            settled = true
+            stored = value
+            if let waiting = continuation {
+                continuation = nil
+                waiting.resume(returning: value)
+            }
+        }
+    }
+
+    static func awaitValue(          // internal for DeadlineTests
+        of task: Task<String?, Never>?, deadline seconds: Double
+    ) async -> String? {
+        guard let task else { return nil }
+        let watchdog = Task {
+            try await Task.sleep(for: .seconds(seconds))
+            task.cancel()
+        }
+        defer { watchdog.cancel() }
+        // Cancellation is cooperative — the decode checks per frame — but a
+        // single Core ML prediction that never returns would ignore it and
+        // inherit the hang. Stop waiting shortly after the deadline regardless.
+        return await abandoning(after: seconds + 2) { await task.value } ?? nil
     }
 
     // MARK: - Logging
 
     private func log(
         _ raw: String,
+        engine engineName: String? = nil,
+        appleRaw: String? = nil,
         formatted: String?,
         recognition: [RecognitionResult],
         timings: TranscriptEntry.Timings? = nil,
+        pasteTarget: String? = nil,
+        audio: TranscriptEntry.AudioHealth? = nil,
         context: RecordingContext?
     ) async {
         let elapsed = context.map { ContinuousClock.now - $0.startedAt } ?? .zero
@@ -384,10 +611,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             locale: await engine.locale?.identifier,
             appBundleID: context?.appBundleID,
             appName: context?.appName,
+            pasteTarget: pasteTarget,
             raw: raw,
+            engine: engineName,
+            appleRaw: appleRaw,
             recognition: recognition.isEmpty ? nil : recognition,
             formatted: formatted,
-            timings: timings
+            timings: timings,
+            audio: audio
         )
         await TranscriptLog.shared.append(entry)
     }

@@ -51,6 +51,21 @@ final class HotkeyMonitor {
         // hotkey just stops working with no error.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+
+            // Re-enabling is not enough. The key-up that would have ended this
+            // dictation was dropped while the tap was off and is never
+            // redelivered, so without synthesising the release here the app
+            // sits on "Listening" forever — and worse, `isDown` stays true, so
+            // the `!isDown` guard below swallows every later press too. The
+            // hotkey looks dead and the panel looks hung (2026-08-11).
+            //
+            // The tap's run loop source lives on the main run loop, so anything
+            // that blocks the main thread long enough gets the tap switched off
+            // by the system. That is a recoverable condition, not a fatal one.
+            if isDown {
+                isDown = false
+                onRelease?()
+            }
             return Unmanaged.passUnretained(event)
         }
 

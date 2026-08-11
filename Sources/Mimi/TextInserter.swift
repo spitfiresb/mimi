@@ -6,9 +6,17 @@ import CoreGraphics
 enum TextInserter {
     private static let vKeyCode: CGKeyCode = 9
 
-    /// How long to wait after ⌘V before putting the old clipboard back.
-    /// Too short and the target app reads stale pasteboard data.
-    private static let restoreDelay = Duration.milliseconds(150)
+    /// How long to leave our text on the pasteboard before putting the user's
+    /// clipboard back.
+    ///
+    /// Reading the pasteboard after ⌘V is asynchronous and entirely the target
+    /// app's business, so this is a race we can only lose loudly: restore too
+    /// early and the app pastes *the previous clipboard contents*. At 150ms that
+    /// happened for real — a 50MB screenshot (TIFF + BMP + PNG + seven other
+    /// representations) got pasted instead of the transcript, because snapshot,
+    /// write, and restore of that much data all had to finish inside the window
+    /// (2026-08-11). Generous now that waiting costs the dictation nothing.
+    private static let restoreDelay = Duration.milliseconds(1200)
 
     static func insert(_ text: String) async {
         guard !text.isEmpty else { return }
@@ -18,14 +26,24 @@ enum TextInserter {
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+        let ours = pasteboard.changeCount
 
         // The user may still be holding ⌃⌥ from the hotkey. Physical modifiers
         // merge with synthesized ones, which would turn our ⌘V into ⌃⌥⌘V.
         await waitForModifiersToClear()
         postPaste()
 
-        try? await Task.sleep(for: restoreDelay)
-        restore(snapshot, to: pasteboard)
+        // Off the critical path: the dictation is finished the moment ⌘V is
+        // posted, so the user should never wait on clipboard housekeeping.
+        Task.detached {
+            try? await Task.sleep(for: restoreDelay)
+            await MainActor.run {
+                let board = NSPasteboard.general
+                // Someone copied something while we waited — theirs wins.
+                guard board.changeCount == ours else { return }
+                restore(snapshot, to: board)
+            }
+        }
     }
 
     private static func waitForModifiersToClear() async {

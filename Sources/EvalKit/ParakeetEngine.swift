@@ -31,9 +31,19 @@ public final class ParakeetEngine: EvalEngine {
     /// One encoder package per fixed window (ParakeetEncoderW301 etc.); pad
     /// mels up to the smallest window that fits. Fixed shapes are what let the
     /// encoder on the ANE at all — EnumeratedShapes and RangeDim exports both
-    /// crash the E5/BNNS compiler (2026-08-07). Encoders load lazily: each is
-    /// ~600MB of weights and this is an 8GB machine.
-    static let windows = [301, 1501, 3001]
+    /// crash the E5/BNNS compiler (2026-08-07).
+    ///
+    /// Only the 30s window is used, because the packages are ~570MB *each* and
+    /// the weights dominate their size — a 301-frame encoder is no cheaper to
+    /// hold than a 3001-frame one. Keeping three of them meant ~1.7GB resident
+    /// on an 8GB machine, so whichever window a dictation needed had usually
+    /// been evicted: measured 63.5s to load W3001, 2.6s warm, 65.6s after
+    /// eviction, then an outright allocation failure that returned empty text
+    /// (2026-08-11). One always-warm model costs a short utterance ~36ms of
+    /// padding it didn't need and removes the eviction churn entirely. It also
+    /// keeps chunk seams as rare as possible, which is the other reason not to
+    /// prefer a smaller window.
+    public static let windows = [3001]
 
     public init(modelsDir: URL, int8: Bool = true) {
         self.modelsDir = modelsDir
@@ -102,27 +112,44 @@ public final class ParakeetEngine: EvalEngine {
     }
 
     public func transcribe(_ audioURL: URL) async throws -> (text: String, processing: Duration) {
+        let allSamples = try Self.load16kMono(audioURL)
+        let clock = ContinuousClock()
+        let start = clock.now
+        let text = try transcribe(samples16k: allSamples)
+        return (text, clock.now - start)
+    }
+
+    /// Transcribe 16kHz mono samples directly — the app's path: it already holds
+    /// the session's audio and shouldn't round-trip through a file.
+    public func transcribe(samples16k allSamples: [Float]) throws -> String {
         let (decoder, joint, meta) = lock.withLock { (self.decoder, self.joint, self.meta) }
         guard let decoder, let joint, let meta else {
             throw EvalError.engineUnavailable("prepare() not called")
         }
 
-        let allSamples = try Self.load16kMono(audioURL)
-
-        let clock = ContinuousClock()
-        let start = clock.now
-
-        // >30s audio exceeds the largest enumerated window: split into ~29.4s
-        // chunks and join the texts. Crude segmentation (a word can straddle a
-        // cut) but it keeps every utterance scoreable; the app never dictates
-        // 30s unbroken anyway.
+        // >30s audio exceeds the largest window: split into ~29.4s chunks and
+        // join the texts. Crude segmentation (a word can straddle a cut — seen
+        // once as a duplicated seam word in a 45s take); Stage 6's VAD
+        // segmentation replaces this.
         let maxChunk = 2940 * MelFrontend.hopLength
         var texts: [String] = []
         for chunkStart in stride(from: 0, to: allSamples.count, by: maxChunk) {
+            // Decode is uninterruptible Core ML work on a synchronous call, so
+            // cancellation is cooperative: the caller's deadline only bites if
+            // we look. Chunk granularity is ~15s — too coarse on its own, which
+            // is why the per-frame loop checks too.
+            try Task.checkCancellation()
             let samples = Array(allSamples[chunkStart..<min(chunkStart + maxChunk, allSamples.count)])
             texts.append(try transcribeChunk(samples, decoder: decoder, joint: joint, meta: meta))
         }
-        return (texts.joined(separator: " ").trimmingCharacters(in: .whitespaces), clock.now - start)
+        return texts.joined(separator: " ").trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Preload encoder packages so the first dictation doesn't pay the model
+    /// load. Call off the main thread; each load is O(seconds) from the
+    /// compile cache.
+    public func warmEncoders(windows: [Int] = ParakeetEngine.windows) {
+        for window in windows { _ = try? encoder(for: window) }
     }
 
     private func transcribeChunk(
@@ -160,6 +187,7 @@ public final class ParakeetEngine: EvalEngine {
         lengthArray[0] = NSNumber(value: frontend.validFrames(for: samples.count))
 
         // --- encoder ---
+        try Task.checkCancellation()
         let encClock = ContinuousClock.now
         let encOut = try Self.predictSync(encoder(for: window), ["mel": melArray, "length": lengthArray])
         let encoderMs = Int((ContinuousClock.now - encClock) / .milliseconds(1))
@@ -196,6 +224,9 @@ public final class ParakeetEngine: EvalEngine {
         let maxSymbolsPerFrame = 10
 
         while t < frames {
+            // One joint prediction per iteration (~10-40ms), so a cancelled
+            // caller is honoured within a frame rather than at chunk end.
+            try Task.checkCancellation()
             encoded.withUnsafeBufferPointer { src in
                 framePtr.update(from: src.baseAddress! + t * dModel, count: dModel)
             }
