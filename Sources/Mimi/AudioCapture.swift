@@ -1,5 +1,8 @@
 import AVFoundation
+import ObjCShims
+import QuartzCore
 import Speech
+import os
 
 /// Captures microphone audio and yields it as `AnalyzerInput` in whatever format
 /// the transcriber asked for. We never hardcode 16kHz — `SpeechAnalyzer` tells us
@@ -14,7 +17,13 @@ import Speech
 /// Privacy: the mic is hot while Mimi runs, but nothing is retained beyond the
 /// pre-roll window and nothing ever leaves the process, let alone the machine.
 final class AudioCapture {
-    private let engine = AVAudioEngine()
+    private static let log = Logger(subsystem: "com.zainsaeed.mimi", category: "audio")
+
+    /// Recreated wholesale on revival: an AVAudioEngine that has gone zombie
+    /// (isRunning=true, zero buffers delivered) can throw NSExceptions from
+    /// installTap on formats that are perfectly valid — its internal state is
+    /// not trustworthy once the input has died under it (2026-08-11).
+    private var engine = AVAudioEngine()
     private var converter: AVAudioConverter?
 
     private static let preRollSeconds = 0.5
@@ -39,6 +48,12 @@ final class AudioCapture {
     /// Set when the tap is installed, reported per dictation in the log.
     private var pinnedDevice: AudioDeviceID?
     private var tapRate: Double = 0
+
+    /// When the tap last delivered a buffer, guarded by `lock`. At 4096 frames
+    /// of 48kHz audio the cadence is ~85ms, so a second of silence from the
+    /// callback means the input is dead no matter what `isRunning` says.
+    private var lastBufferAt: TimeInterval = 0
+    private static let stallThreshold: TimeInterval = 1.0
 
     /// Capture-side facts for the transcript log: which device fed the tap, its
     /// hardware rate right now, and the rate the tap was installed with. A
@@ -138,19 +153,66 @@ final class AudioCapture {
     func prepare(outputFormat: AVAudioFormat) throws {
         self.outputFormat = outputFormat
         try installTapAndStart(outputFormat: outputFormat)
+
+        // A route/device change (headphones in, AirPods out, rate switch) stops
+        // the engine's I/O and posts this instead of throwing anywhere.
+        // object is nil, not the engine: revival replaces the engine instance,
+        // and an observer pinned to the old object would go deaf exactly when
+        // it matters most.
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.ensureRunning()
+        }
     }
 
     /// Sleep/wake and device changes silently stop the engine — a hot mic is only
     /// hot until the first lid close. Re-prepares from scratch: the input format
     /// may have changed while we were down (different mic, different rate).
-    func ensureRunning() {
-        guard let outputFormat, !engine.isRunning else { return }
-        engine.inputNode.removeTap(onBus: 0)
+    ///
+    /// `engine.isRunning` alone is not a health check: after a configuration
+    /// change the engine can report running while the input render callbacks
+    /// have stopped for good. That zombie state recorded peak=0/seconds=0 for
+    /// every dictation across 8 minutes of retries while this guard kept
+    /// returning early (2026-08-11). So trust the buffer heartbeat instead:
+    /// running-but-silent past the stall threshold gets torn down and rebuilt.
+    /// Returns whether the engine is delivering (or was just revived and should
+    /// be) — false means the mic is genuinely unavailable and the caller must
+    /// not pretend to listen.
+    @discardableResult
+    func ensureRunning() -> Bool {
+        guard let outputFormat else { return false }
+        lock.lock()
+        let last = lastBufferAt
+        lock.unlock()
+        let sinceBuffer = CACurrentMediaTime() - last
+        let stalled = engine.isRunning && sinceBuffer > Self.stallThreshold
+        guard !engine.isRunning || stalled else { return true }
+        Self.log.warning(
+            "reviving engine: isRunning=\(self.engine.isRunning) sinceBuffer=\(sinceBuffer, format: .fixed(precision: 2))s")
+
+        // Tear the old engine down defensively — it may throw from any call at
+        // this point — and replace it outright rather than reuse it.
+        if let error = MMCatchException({
+            self.engine.stop()
+            self.engine.inputNode.removeTap(onBus: 0)
+        }) {
+            Self.log.warning("old engine teardown threw (continuing): \(error.localizedDescription)")
+        }
+        engine = AVAudioEngine()
+
         lock.lock()
         preRoll.removeAll()
         preRollFrames = 0
         lock.unlock()
-        try? installTapAndStart(outputFormat: outputFormat)
+        do {
+            try installTapAndStart(outputFormat: outputFormat)
+            Self.log.notice("engine revived")
+            return true
+        } catch {
+            Self.log.error("engine revival failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     private func installTapAndStart(outputFormat: AVAudioFormat) throws {
@@ -174,9 +236,33 @@ final class AudioCapture {
             pinnedDevice = builtIn
         }
 
-        let inputFormat = input.outputFormat(forBus: 0)
+        // inputFormat, not outputFormat: after pinning a device onto the AUHAL,
+        // outputFormat(forBus:) keeps reporting the *previous* default device's
+        // rate — measured live: AirPods at 24kHz as system default, built-in
+        // pinned at 48kHz, outputFormat still says 24kHz while inputFormat
+        // correctly tracks the pinned hardware (2026-08-11). A tap installed at
+        // the stale rate gets zero callbacks from CoreAudio, silently, forever:
+        // that is what every "dictation heard nothing" today actually was.
+        let inputFormat = input.inputFormat(forBus: 0)
         tapRate = inputFormat.sampleRate
 
+        if let pinnedDevice, let hardwareRate = Self.nominalSampleRate(pinnedDevice),
+           hardwareRate != inputFormat.sampleRate {
+            Self.log.warning(
+                "tap rate \(inputFormat.sampleRate) still disagrees with hardware \(hardwareRate); capture may be dead")
+        }
+
+        // A dead or mid-transition input device reports a 0Hz/0ch format here.
+        // Feeding that to installTap raises an Objective-C NSException that no
+        // Swift catch can stop — it unwinds through whatever async caller is on
+        // the stack and strands its state (the frozen "Listening" panel,
+        // 2026-08-11). Refuse it as a Swift error instead.
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            Self.log.error("input format invalid (rate=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount)); refusing tap install")
+            throw MimiError.audioConversionUnsupported
+        }
+
+        Self.log.notice("installing tap: input \(inputFormat.sampleRate)Hz/\(inputFormat.channelCount)ch -> output \(outputFormat.sampleRate)Hz")
         guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
             throw MimiError.audioConversionUnsupported
         }
@@ -184,28 +270,56 @@ final class AudioCapture {
         self.converter = converter
         maxPreRollFrames = AVAudioFrameCount(outputFormat.sampleRate * Self.preRollSeconds)
 
-        // This block runs on a real-time audio thread. Keep it cheap; yielding to
-        // an AsyncStream continuation is safe.
-        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            guard let self, let converted = self.convert(buffer) else { return }
+        // installTap and start report misuse as NSExceptions, which would
+        // otherwise unwind uncatchably through whatever async caller is on the
+        // stack. The shim turns them into errors we can log and survive.
+        if let objcError = MMCatchException({
+            // This block runs on a real-time audio thread. Keep it cheap;
+            // yielding to an AsyncStream continuation is safe.
+            input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.lastBufferAt = CACurrentMediaTime()
+                self.lock.unlock()
+                guard let converted = self.convert(buffer) else { return }
 
-            self.lock.lock()
-            if let continuation = self.continuation {
-                if self.isRecordingAudio { self.recorded.append(converted) }
-                self.lock.unlock()
-                continuation.yield(AnalyzerInput(buffer: converted))
-            } else {
-                self.preRoll.append(converted)
-                self.preRollFrames += converted.frameLength
-                while self.preRollFrames > self.maxPreRollFrames, !self.preRoll.isEmpty {
-                    self.preRollFrames -= self.preRoll.removeFirst().frameLength
+                self.lock.lock()
+                if let continuation = self.continuation {
+                    if self.isRecordingAudio { self.recorded.append(converted) }
+                    self.lock.unlock()
+                    continuation.yield(AnalyzerInput(buffer: converted))
+                } else {
+                    self.preRoll.append(converted)
+                    self.preRollFrames += converted.frameLength
+                    while self.preRollFrames > self.maxPreRollFrames, !self.preRoll.isEmpty {
+                        self.preRollFrames -= self.preRoll.removeFirst().frameLength
+                    }
+                    self.lock.unlock()
                 }
-                self.lock.unlock()
             }
+            self.engine.prepare()
+        }) {
+            Self.log.error("tap install threw: \(objcError.localizedDescription)")
+            throw objcError
         }
 
-        engine.prepare()
-        try engine.start()
+        var startError: Error?
+        if let objcError = MMCatchException({
+            do { try self.engine.start() } catch { startError = error }
+        }) {
+            Self.log.error("engine start threw: \(objcError.localizedDescription)")
+            throw objcError
+        }
+        if let startError {
+            Self.log.error("engine start failed: \(startError.localizedDescription)")
+            throw startError
+        }
+
+        // Seed the heartbeat so a dictation begun before the first buffer
+        // arrives doesn't read as a stall and tear the engine straight down.
+        lock.lock()
+        lastBufferAt = CACurrentMediaTime()
+        lock.unlock()
     }
 
     /// Begin a recording: returns a stream that starts with the pre-roll and

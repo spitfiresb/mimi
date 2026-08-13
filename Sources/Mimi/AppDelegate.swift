@@ -2,9 +2,11 @@ import AVFoundation
 import AppKit
 import EvalKit
 import Speech
+import os
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private static let log = Logger(subsystem: "com.zainsaeed.mimi", category: "flow")
     private var statusItem: NSStatusItem!
     private var launchAtLoginItem: NSMenuItem?
     private var formattingItem: NSMenuItem?
@@ -160,17 +162,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func bootstrap() async {
+        Self.log.notice("bootstrap: checking microphone")
         guard await Permissions.microphoneAuthorized() else {
+            Self.log.error("bootstrap: microphone denied")
             setState(symbol: "mic.slash", status: "Microphone access denied")
             return
         }
 
         // Prompt once, then poll — granting Accessibility shouldn't require a restart.
         if !Permissions.accessibilityTrusted(prompt: true) {
+            Self.log.warning("bootstrap: waiting for Accessibility grant")
             setState(symbol: "mic.slash", status: "Waiting for Accessibility permission…")
             while !Permissions.accessibilityTrusted(prompt: false) {
                 try? await Task.sleep(for: .seconds(1))
             }
+            Self.log.notice("bootstrap: Accessibility granted")
         }
 
         do {
@@ -187,7 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.audio.ensureRunning() }
+                MainActor.assumeIsolated { _ = self?.audio.ensureRunning() }
             }
         } catch {
             setState(symbol: "mic.slash", status: "Error: \(error.localizedDescription)")
@@ -214,17 +220,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hotkey.onRelease = { [weak self] in Task { @MainActor in await self?.endRecording() } }
 
         guard hotkey.start() else {
+            Self.log.error("bootstrap: event tap creation failed")
             setState(symbol: "mic.slash", status: "Could not install the hotkey — check Accessibility")
             return
         }
 
+        Self.log.notice("bootstrap: ready, hotkey installed")
         setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
     }
 
     // MARK: - Recording
 
     private func beginRecording() async {
-        guard !isRecording else { return }
+        guard !isRecording else {
+            Self.log.warning("press ignored: already recording")
+            return
+        }
+
+        // Refuse to fake a recording the mic can't feed. Showing "Listening" and
+        // then eating the dictation is the worst outcome this app can produce;
+        // an honest error is recoverable, silence is a bug report (2026-08-11).
+        guard audio.ensureRunning() else {
+            Self.log.error("press refused: audio engine unavailable")
+            setState(symbol: "mic.slash", status: "Mic unavailable — check input device")
+            return
+        }
+
+        Self.log.notice("beginRecording")
         isRecording = true
 
         let frontmost = NSWorkspace.shared.frontmostApplication
@@ -250,12 +272,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             await self?.endRecording()
         }
 
-        // Belt to the wake notification's suspenders — if anything else stopped
-        // the engine, revive it before capturing.
-        audio.ensureRunning()
-
         // Capture audio from the first instant; the stream buffers while the
-        // session spins up.
+        // session spins up. (Engine health was already proven above, before the
+        // panel went up.)
         let stream = audio.start()
 
         previewStats = PreviewStats()
@@ -311,6 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previewStats = PreviewStats()
 
     private func endRecording() async {
+        Self.log.notice("endRecording: isRecording=\(self.isRecording)")
         guard isRecording else {
             // A release with nothing recording means the press and release
             // transitions raced, or the press was lost. Either way the panel may
@@ -343,10 +363,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } ?? nil
 
         guard let session else {
+            Self.log.error("endRecording: session never started; dictation dropped")
             pending?.cancel()
             audio.stop()
             overlay.hide()
-            setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
+            setState(symbol: "mic.slash", status: "Transcriber didn't start — try again")
             return
         }
         setState(symbol: "mic", status: "Transcribing…")
@@ -513,7 +534,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 context: context
             )
         }
-        setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
+        if audioSeconds == 0 {
+            // The tap delivered nothing at all — the engine was dead for this
+            // whole dictation. ensureRunning's stall detection rebuilds it on
+            // the next press; say so instead of a silent "Ready" that reads as
+            // the app eating the dictation.
+            audio.ensureRunning()
+            setState(symbol: "mic.slash", status: "Mic heard nothing — restarted, try again")
+        } else {
+            setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
+        }
     }
 
     /// Timeout for non-throwing async work: returns nil if the deadline passes.

@@ -1,11 +1,14 @@
 import AppKit
 import CoreGraphics
+import os
 
 /// Global push-to-talk on ⌃⌥Space via a CGEventTap.
 ///
 /// Requires Accessibility permission: we use `.defaultTap` (not `.listenOnly`)
 /// so we can swallow the chord and stop it reaching the focused app.
 final class HotkeyMonitor {
+    private static let log = Logger(subsystem: "com.zainsaeed.mimi", category: "hotkey")
+
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
 
@@ -50,6 +53,7 @@ final class HotkeyMonitor {
         // The system disables taps that take too long, silently. Without this the
         // hotkey just stops working with no error.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            Self.log.warning("event tap disabled (\(type.rawValue)); re-enabling, isDown=\(self.isDown)")
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
 
             // Re-enabling is not enough. The key-up that would have ended this

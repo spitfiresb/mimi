@@ -122,6 +122,11 @@ leaves behind that Act II builds on:
 Ordering principle: **the harness first, because it validates everything after
 it.** A converted model without a harness is a demo; with one it's a result.
 
+*Added 2026-08-11:* the next arc — making Parakeet stream partials during
+speech instead of batch-decoding at release — has its own plan of record in
+[STREAMING.md](STREAMING.md) (stages S0–S4). It closes Stage 3's latency
+checkbox, answers open question #2, and feeds the Stage 7 matrix.
+
 ### Stage 3 — The eval harness 🟡 *(started 2026-08-06)*
 
 The XCTest target the project has never had, and the stage every later claim
