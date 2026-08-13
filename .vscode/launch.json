@@ -1,0 +1,64 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mimi}",
+            "name": "Debug mimi-eval",
+            "target": "mimi-eval",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug mimi-eval"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mimi}",
+            "name": "Release mimi-eval",
+            "target": "mimi-eval",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release mimi-eval"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mimi}",
+            "name": "Debug encprobe",
+            "target": "encprobe",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug encprobe"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mimi}",
+            "name": "Release encprobe",
+            "target": "encprobe",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release encprobe"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mimi}",
+            "name": "Debug Mimi",
+            "target": "Mimi",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Mimi"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mimi}",
+            "name": "Release Mimi",
+            "target": "Mimi",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Mimi"
+        }
+    ]
+}
