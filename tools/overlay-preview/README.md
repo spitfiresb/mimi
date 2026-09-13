@@ -1,5 +1,8 @@
 # Overlay studio
 
+This browser studio retains the earlier frosted HUD approximation and does not
+render the native app's current Liquid Glass material.
+
 Run from the repository root:
 
 ```sh
@@ -16,7 +19,7 @@ dictations. Settings save automatically to this browser's local storage; Export
 design downloads a JSON file for implementing the selected appearance in AppKit.
 Edits to HTML/CSS/JS files appear on browser refresh. There is no build step.
 
-The baseline follows `Sources/Mimi/OverlayPanel.swift`: 220–460 point width,
+The baseline follows the previous frosted overlay: 220–460 point width,
 14 point corners, 16/12 point horizontal/vertical padding, 14 point medium system
 type, waveform/lock glyph, and dim unconfirmed words. Startup is invisible;
 hands-free uses a lock icon without an instruction line. The browser's background blur, shadows and glyphs approximate AppKit's

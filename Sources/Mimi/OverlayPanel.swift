@@ -13,7 +13,7 @@ import AppKit
 @MainActor
 final class OverlayPanel {
     private let panel: NonActivatingPanel
-    private let blur: NSVisualEffectView
+    private let glass: NSGlassEffectView
     private let glyph: NSImageView
     private let label: NSTextField
 
@@ -23,7 +23,7 @@ final class OverlayPanel {
     private static let vPad: CGFloat = 12
     private static let glyphWidth: CGFloat = 18
     private static let glyphGap: CGFloat = 10
-    private static let cornerRadius: CGFloat = 14
+    private static let cornerRadius: CGFloat = 22
     private static let bottomInset: CGFloat = 120
     private static let font = NSFont.systemFont(ofSize: 14, weight: .medium)
 
@@ -45,23 +45,18 @@ final class OverlayPanel {
         panel.collectionBehavior = [
             .canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle,
         ]
-        // The HUD material is dark regardless of system theme; pin the whole
-        // panel to dark so semantic colors resolve against it. In light mode,
-        // labelColor was resolving to black before vibrancy kicked in — a black
-        // flash on every commit.
-        panel.appearance = NSAppearance(named: .darkAqua)
-
-        blur = NSVisualEffectView()
-        blur.material = .hudWindow
-        blur.blendingMode = .behindWindow
-        blur.state = .active
-        // Rounding the layer leaves the material's square corners peeking out
-        // behind the mask. maskImage clips the material itself.
-        blur.maskImage = Self.roundedMask(radius: Self.cornerRadius)
+        // Follow the system appearance and leave the clear material untinted.
+        // A dark tint made the small overlay read as a flat, opaque slab.
+        // Native glass owns its blur/refraction; it has no magnification knob.
+        panel.appearance = nil
+        glass = NSGlassEffectView()
+        glass.style = .clear
+        glass.cornerRadius = Self.cornerRadius
+        glass.tintColor = nil
 
         glyph = NSImageView()
         glyph.imageScaling = .scaleProportionallyUpOrDown
-        glyph.contentTintColor = .secondaryLabelColor
+        glyph.contentTintColor = NSColor.white.withAlphaComponent(0.72)
         glyph.image = NSImage(
             systemSymbolName: "waveform",
             accessibilityDescription: "Listening"
@@ -77,16 +72,15 @@ final class OverlayPanel {
         label.lineBreakMode = .byWordWrapping
         label.wantsLayer = true
 
-        // Text must not be vibrancy-blended: mid-crossfade, vibrant compositing
-        // mixes the two text snapshots darker — a black flash on every update.
-        // A non-vibrant container renders it plain, so fades stay gray-to-white.
+        // Put sharp, non-vibrant text in the glass's supported content slot.
+        // The system handles live backdrop refraction and the specular rim;
+        // the transcript itself must not be distorted or vibrancy-blended.
         let content = NonVibrantView()
         content.autoresizingMask = [.width, .height]
         content.addSubview(glyph)
         content.addSubview(label)
-        blur.addSubview(content)
-        content.frame = blur.bounds
-        panel.contentView = blur
+        glass.contentView = content
+        panel.contentView = glass
     }
 
     // MARK: - States
@@ -176,18 +170,18 @@ final class OverlayPanel {
     private func render(committed: String, volatile: String, animated: Bool) {
         let text = NSMutableAttributedString()
         text.append(NSAttributedString(string: committed, attributes: [
-            .font: Self.font, .foregroundColor: NSColor.labelColor,
+            .font: Self.font, .foregroundColor: NSColor.white,
         ]))
         if !volatile.isEmpty {
             let joined = committed.isEmpty || committed.hasSuffix(" ") ? volatile : " " + volatile
             text.append(NSAttributedString(string: joined, attributes: [
-                .font: Self.font, .foregroundColor: NSColor.tertiaryLabelColor,
+                .font: Self.font, .foregroundColor: NSColor.white.withAlphaComponent(0.62),
             ]))
         }
 
         transcriptText = text.string
 
-        if animated {
+        if animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             let fade = CATransition()
             fade.type = .fade
             fade.duration = 0.15
@@ -233,7 +227,7 @@ final class OverlayPanel {
             height: 14
         )
 
-        if panel.isVisible {
+        if panel.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.15
                 context.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -247,6 +241,7 @@ final class OverlayPanel {
     // MARK: - Pulse
 
     private func startPulse() {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         let pulse = CABasicAnimation(keyPath: "opacity")
         pulse.fromValue = 1.0
         pulse.toValue = 0.35
@@ -259,19 +254,6 @@ final class OverlayPanel {
 
     private func stopPulse() {
         glyph.layer?.removeAnimation(forKey: "pulse")
-    }
-
-    // MARK: -
-
-    private static func roundedMask(radius: CGFloat) -> NSImage {
-        let side = radius * 2 + 1
-        let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
-            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
-            return true
-        }
-        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
-        image.resizingMode = .stretch
-        return image
     }
 }
 

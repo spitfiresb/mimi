@@ -45,11 +45,20 @@ Mimi's menu if you want the optional language-model pass; existing saved choices
 are preserved. A successful Parakeet result pastes without waiting for Apple's
 final transcript. Apple still provides live preview and fallback recognition.
 
-## Overlay design preview
+## Overlay appearance
+
+The native overlay uses untinted clear Liquid Glass and follows the system
+appearance, with rounded edges and crisp white text. Unconfirmed words stay
+dimmer as the panel grows with the transcript. Appearance is configured in
+`Sources/Mimi/OverlayPanel.swift`; temporary settings from the removed appearance
+editor are no longer used. macOS controls the native material's blur and
+refraction; this is not a custom magnifying lens.
+
+### Legacy browser studio
 
 Run `python3 tools/overlay-preview/serve.py`, then open
 [localhost:8769](http://localhost:8769) to explore every overlay state and edit
 its appearance live. No Swift build, microphone, or speech models are needed.
 Browser settings save locally and can be exported as a design JSON file.
-The browser approximates macOS materials; designs are applied to native Mimi
+The browser retains the earlier frosted-glass approximation; designs are applied to native Mimi
 separately. See [the preview guide](tools/overlay-preview/README.md).
