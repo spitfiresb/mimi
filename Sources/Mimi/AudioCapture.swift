@@ -8,14 +8,9 @@ import os
 /// the transcriber asked for. We never hardcode 16kHz — `SpeechAnalyzer` tells us
 /// the format via `bestAvailableAudioFormat(compatibleWith:)`.
 ///
-/// The engine runs continuously from `prepare()`, not from keypress. Starting the
-/// engine on demand loses the first ~1s of speech to hardware spin-up, which turns
-/// "the quarterly report" into "orderly report". While idle, converted audio goes
-/// into a small rolling pre-roll buffer; on `start()` the pre-roll is flushed into
-/// the stream first, so words spoken slightly before the press still land.
-///
-/// Privacy: the mic is hot while Mimi runs, but nothing is retained beyond the
-/// pre-roll window and nothing ever leaves the process, let alone the machine.
+/// Capture runs only between an explicit start and stop. Startup is asynchronous;
+/// callers wait for a real buffer before telling the user to speak. There is no
+/// idle pre-roll, microphone I/O or resampling.
 final class AudioCapture {
     private static let log = Logger(subsystem: "com.zainsaeed.mimi", category: "audio")
 
@@ -23,25 +18,24 @@ final class AudioCapture {
     /// (isRunning=true, zero buffers delivered) can throw NSExceptions from
     /// installTap on formats that are perfectly valid — its internal state is
     /// not trustworthy once the input has died under it (2026-08-11).
-    private var engine = AVAudioEngine()
-    private var converter: AVAudioConverter?
+    ///
+    /// Optional and lock-guarded because a revival *detaches* the old engine
+    /// before tearing it down: if that teardown blocks in the HAL, the stuck
+    /// thread is left holding the only reference to a engine nothing else will
+    /// ever touch again, instead of wedging the next attempt.
+    private var engine: AVAudioEngine?
 
-    private static let preRollSeconds = 0.5
-
-    /// Guards the three fields below; the tap callback runs on a real-time
-    /// audio thread while start/stop run on the main actor.
+    /// Guards every field below; the tap callback runs on a real-time audio
+    /// thread, revivals run on a background queue, and start/stop run on the
+    /// main actor.
     private let lock = NSLock()
     private var continuation: AsyncStream<AnalyzerInput>.Continuation?
-    private var preRoll: [AVAudioPCMBuffer] = []
-    private var preRollFrames: AVAudioFrameCount = 0
+    private var firstBufferAt: ContinuousClock.Instant?
 
     /// The recording's converted buffers, kept alongside the analyzer stream so
     /// Parakeet can transcribe the same audio the analyzer heard. Bounded by
     /// `stop()` — one dictation's worth.
     private var recorded: [AVAudioPCMBuffer] = []
-    private var isRecordingAudio = false
-
-    private var maxPreRollFrames: AVAudioFrameCount = 0
 
     private var outputFormat: AVAudioFormat?
 
@@ -49,23 +43,37 @@ final class AudioCapture {
     private var pinnedDevice: AudioDeviceID?
     private var tapRate: Double = 0
 
-    /// When the tap last delivered a buffer, guarded by `lock`. At 4096 frames
-    /// of 48kHz audio the cadence is ~85ms, so a second of silence from the
-    /// callback means the input is dead no matter what `isRunning` says.
-    private var lastBufferAt: TimeInterval = 0
-    private static let stallThreshold: TimeInterval = 1.0
+    /// Device facts snapshotted on the engine queue at tap-install time, so
+    /// `captureHealth()` can answer from memory. See that method for why they
+    /// are not read live.
+    private var deviceNameSnapshot: String?
+    private var deviceRateSnapshot: Double?
+
+    /// Real-buffer readiness, separate from the grace period before recovery.
+    private var heartbeat = CaptureHeartbeat()
+
+    /// Revival bookkeeping, guarded by `lock` like everything else here.
+    private var revival = RevivalState()
+
+    /// How long a revival may run before it is written off as wedged in the
+    /// HAL. Generous: a healthy revival on a cold device takes ~2s, and the
+    /// cost of declaring one dead early is a redundant engine rebuild.
+    private static let revivalTimeout: TimeInterval = 12.0
 
     /// Capture-side facts for the transcript log: which device fed the tap, its
-    /// hardware rate right now, and the rate the tap was installed with. A
-    /// mismatch between the last two means the input node's cached format went
-    /// stale across the device pin — audio arrives garbled at the wrong speed.
+    /// hardware rate, and the rate the tap was installed with. A mismatch
+    /// between the last two means the input node's cached format went stale
+    /// across the device pin — audio arrives garbled at the wrong speed.
+    ///
+    /// Answers from a snapshot taken at tap-install time rather than querying
+    /// CoreAudio now. This runs on the main actor at the end of every
+    /// dictation, and `AudioObjectGetPropertyData` is a synchronous round trip
+    /// to coreaudiod that can block for as long as coreaudiod is unwell — the
+    /// same hazard that froze the app on 2026-08-13, on a path that only exists
+    /// to decorate a log line.
     func captureHealth() -> (device: String?, deviceRate: Double?, tapRate: Double?) {
-        let device = pinnedDevice ?? Self.defaultInputDeviceID()
-        return (
-            device.flatMap(Self.deviceName),
-            device.flatMap(Self.nominalSampleRate),
-            tapRate > 0 ? tapRate : nil
-        )
+        lock.lock(); defer { lock.unlock() }
+        return (deviceNameSnapshot, deviceRateSnapshot, tapRate > 0 ? tapRate : nil)
     }
 
     private static func defaultInputDeviceID() -> AudioDeviceID? {
@@ -149,91 +157,251 @@ final class AudioCapture {
         return nil
     }
 
-    /// Call once at bootstrap. The engine stays running for the app's lifetime.
-    func prepare(outputFormat: AVAudioFormat) throws {
+    /// Configure the output and route observer without opening the microphone.
+    func prepare(outputFormat: AVAudioFormat) {
+        lock.lock()
         self.outputFormat = outputFormat
-        try installTapAndStart(outputFormat: outputFormat)
+        lock.unlock()
 
-        // A route/device change (headphones in, AirPods out, rate switch) stops
-        // the engine's I/O and posts this instead of throwing anywhere.
-        // object is nil, not the engine: revival replaces the engine instance,
-        // and an observer pinned to the old object would go deaf exactly when
-        // it matters most.
         NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.ensureRunning()
+        ) { [weak self] notification in
+            guard let changed = notification.object as? AVAudioEngine else { return }
+            self?.configurationChanged(on: changed)
         }
     }
 
-    /// Sleep/wake and device changes silently stop the engine — a hot mic is only
-    /// hot until the first lid close. Re-prepares from scratch: the input format
-    /// may have changed while we were down (different mic, different rate).
+    private func configurationChanged(on changed: AVAudioEngine) {
+        lock.lock()
+        let generation = revival.generation
+        let relevant = revival.captureRequested && engine === changed
+        lock.unlock()
+        guard relevant else { return }
+        // A start/pin also posts configuration changes. Give its first buffer
+        // time to arrive, and ignore notifications from old or unrelated engines.
+        DispatchQueue.global().asyncAfter(deadline: .now() + CaptureHeartbeat.stallThreshold + 0.1) { [weak self] in
+            guard let self, self.isCurrent(generation) else { return }
+            self.ensureRunning()
+        }
+    }
+
+    /// Whether the mic is usable right now, without starting anything.
+    var isAvailable: Bool { isDelivering() }
+
+    /// Whether the tap is delivering audio right now.
     ///
-    /// `engine.isRunning` alone is not a health check: after a configuration
-    /// change the engine can report running while the input render callbacks
-    /// have stopped for good. That zombie state recorded peak=0/seconds=0 for
-    /// every dictation across 8 minutes of retries while this guard kept
-    /// returning early (2026-08-11). So trust the buffer heartbeat instead:
-    /// running-but-silent past the stall threshold gets torn down and rebuilt.
-    /// Returns whether the engine is delivering (or was just revived and should
-    /// be) — false means the mic is genuinely unavailable and the caller must
-    /// not pretend to listen.
+    /// Cheap, non-blocking, and safe from any thread, because it reads only
+    /// Mimi's own bookkeeping. It deliberately does not consult
+    /// `AVAudioEngine.isRunning`: that takes the engine's internal state lock,
+    /// which a revival wedged inside the HAL may be holding, so the health
+    /// check would hang on exactly the failure it exists to detect.
+    private func isDelivering() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return revival.captureRequested && heartbeat.isDelivering(at: CACurrentMediaTime())
+    }
+
+    /// Recover an active dictation without ever starting capture while idle.
+    /// Reads only local state: AVAudioEngine.isRunning can itself hang on a
+    /// CoreAudio lock, so it must not be queried from the main thread.
     @discardableResult
     func ensureRunning() -> Bool {
-        guard let outputFormat else { return false }
         lock.lock()
-        let last = lastBufferAt
+        let now = CACurrentMediaTime()
+        let ready = revival.captureRequested && heartbeat.isDelivering(at: now)
+        let shouldRecover = revival.captureRequested && heartbeat.needsRecovery(at: now)
         lock.unlock()
-        let sinceBuffer = CACurrentMediaTime() - last
-        let stalled = engine.isRunning && sinceBuffer > Self.stallThreshold
-        guard !engine.isRunning || stalled else { return true }
-        Self.log.warning(
-            "reviving engine: isRunning=\(self.engine.isRunning) sinceBuffer=\(sinceBuffer, format: .fixed(precision: 2))s")
+        if shouldRecover { scheduleRevival(reason: "engine not delivering") }
+        return ready
+    }
 
-        // Tear the old engine down defensively — it may throw from any call at
-        // this point — and replace it outright rather than reuse it.
-        if let error = MMCatchException({
-            self.engine.stop()
-            self.engine.inputNode.removeTap(onBus: 0)
+    /// Start or recover only while capture is requested. Coalesce configuration
+    /// notifications and reject all idle or already-running requests.
+    private func scheduleRevival(reason: String, delay: TimeInterval = 0) {
+        lock.lock()
+        let claimed = revival.begin()
+        lock.unlock()
+        guard let generation = claimed else { return }
+
+        Self.log.warning("reviving engine (gen \(generation)): \(reason)")
+
+        // A concurrent queue, not a serial one. A serial queue would be poisoned
+        // by the first wedged attempt: every retry would queue behind a block
+        // that never returns, which is the original bug with a background thread
+        // substituted for the main one. Overlapping attempts are made safe
+        // instead — each builds its own engine and publishes only if it still
+        // holds the newest generation.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.revive(generation: generation)
+        }
+
+        // A revival stuck in the HAL cannot be cancelled or killed; the thread
+        // is gone for as long as coreaudiod says so. All that can be done is
+        // stop waiting on it and let a later attempt try a fresh engine, only
+        // if the user still wants capture.
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay + Self.revivalTimeout) { [weak self] in
+            self?.abandonRevivalIfStuck(generation: generation)
+        }
+    }
+
+    private func revive(generation: Int) {
+        lock.lock()
+        guard revival.isCurrent(generation), revival.inFlight else {
+            lock.unlock()
+            return
+        }
+        let outputFormat = self.outputFormat
+        // Detach the old engine before touching it. If its teardown blocks in
+        // the HAL, this thread is left holding the only reference to it and no
+        // later attempt can be dragged down with it.
+        let old = self.engine
+        self.engine = nil
+        heartbeat.reset()
+        lock.unlock()
+
+        guard let outputFormat else {
+            Self.log.error("revival with no output format; nothing to install")
+            finish(generation: generation)
+            return
+        }
+
+        if let old, let error = MMCatchException({
+            old.stop()
+            old.inputNode.removeTap(onBus: 0)
         }) {
             Self.log.warning("old engine teardown threw (continuing): \(error.localizedDescription)")
         }
-        engine = AVAudioEngine()
 
-        lock.lock()
-        preRoll.removeAll()
-        preRollFrames = 0
-        lock.unlock()
+        guard isCurrent(generation) else { return }
+        let fresh = AVAudioEngine()
         do {
-            try installTapAndStart(outputFormat: outputFormat)
-            Self.log.notice("engine revived")
-            return true
+            let facts = try installTapAndStart(on: fresh, outputFormat: outputFormat, generation: generation)
+            publish(engine: fresh, facts: facts, generation: generation)
         } catch {
             Self.log.error("engine revival failed: \(error.localizedDescription)")
-            return false
+            if let objcError = MMCatchException({ fresh.stop() }) {
+                Self.log.warning("failed engine stop threw: \(objcError.localizedDescription)")
+            }
+            finish(generation: generation)
         }
     }
 
-    private func installTapAndStart(outputFormat: AVAudioFormat) throws {
+    /// Adopt a freshly started engine, unless a newer attempt got there first.
+    private func publish(engine fresh: AVAudioEngine, facts: TapFacts, generation: Int) {
+        lock.lock()
+        guard revival.succeed(generation) else {
+            lock.unlock()
+            Self.log.notice("revival gen \(generation) superseded; discarding its engine")
+            if let error = MMCatchException({ fresh.stop() }) {
+                Self.log.warning("superseded engine stop threw: \(error.localizedDescription)")
+            }
+            return
+        }
+        self.engine = fresh
+        heartbeat.started(at: CACurrentMediaTime())
+        pinnedDevice = facts.pinnedDevice
+        tapRate = facts.tapRate
+        deviceNameSnapshot = facts.deviceName
+        deviceRateSnapshot = facts.deviceRate
+        lock.unlock()
+
+        Self.log.notice("capture engine started; waiting for audio")
+    }
+
+    private func isCurrent(_ generation: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return revival.isCurrent(generation)
+    }
+
+    /// Readiness requires a real converted buffer, not merely engine.start().
+    /// The caller owns the startup deadline and cancellation.
+    func waitUntilReady() async -> Bool {
+        while !Task.isCancelled {
+            if isAvailable { return true }
+            guard captureRequested else { return false }
+            do { try await Task.sleep(for: .milliseconds(20)) }
+            catch { return false }
+        }
+        return false
+    }
+
+    private var captureRequested: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return revival.captureRequested
+    }
+
+    var captureEpoch: ContinuousClock.Instant? {
+        lock.lock(); defer { lock.unlock() }
+        return firstBufferAt
+    }
+
+    /// Retire a failed attempt and queue the next one. Only the newest
+    /// generation may touch shared state: a superseded attempt changes nothing.
+    private func finish(generation: Int) {
+        lock.lock()
+        let failures = revival.fail(generation)
+        lock.unlock()
+
+        guard let failures else {
+            Self.log.notice("revival gen \(generation) superseded; discarding its result")
+            return
+        }
+
+        scheduleRevival(
+            reason: "retry after \(failures) failed attempt(s)",
+            delay: RevivalState.backoff(consecutiveFailures: failures))
+    }
+
+    /// Fires `revivalTimeout` after an attempt started. If that attempt is still
+    /// the current one and still in flight, it is blocked in a HAL call that
+    /// will not return on any schedule Mimi controls.
+    private func abandonRevivalIfStuck(generation: Int) {
+        lock.lock()
+        let failures = revival.abandonIfStuck(generation)
+        lock.unlock()
+
+        guard let failures else { return }
+
+        Self.log.error(
+            "revival gen \(generation) still blocked after \(Self.revivalTimeout, format: .fixed(precision: 0))s — abandoning that thread, retrying on a new engine")
+        scheduleRevival(
+            reason: "previous attempt wedged in CoreAudio",
+            delay: RevivalState.backoff(consecutiveFailures: failures))
+    }
+
+    /// What a tap install learned about the device it attached to, handed back
+    /// rather than written straight to `self`: the caller publishes these only
+    /// if its attempt is still the current one.
+    private struct TapFacts {
+        var pinnedDevice: AudioDeviceID?
+        var tapRate: Double
+        var deviceName: String?
+        var deviceRate: Double?
+    }
+
+    /// Builds and starts a tap on `engine`, returning what it learned.
+    ///
+    /// Runs on a background queue only. Several calls in here — `inputNode`,
+    /// `inputFormat(forBus:)`, every `AudioObject` query — are synchronous round
+    /// trips to coreaudiod that block for as long as coreaudiod takes to
+    /// answer, which after a wake is sometimes forever.
+    private func installTapAndStart(
+        on engine: AVAudioEngine, outputFormat: AVAudioFormat, generation: Int
+    ) throws -> TapFacts {
+        guard isCurrent(generation) else { throw CancellationError() }
         let input = engine.inputNode
+        var facts = TapFacts(pinnedDevice: nil, tapRate: 0, deviceName: nil, deviceRate: nil)
 
         // Pin the built-in mic instead of following the system default input.
         //
-        // The engine runs for the app's lifetime, so following the default means
-        // a connected pair of AirPods sits in microphone mode permanently: macOS
-        // hands their controls to the capturing app ("Cannot Control Mic with
-        // AirPods"), a tap that should play music does nothing, and both
-        // earpieces drop to headset audio quality the whole time Mimi is open.
-        // Bluetooth route changes are also the least stable input an
-        // AVAudioEngine can be handed. A laptop with a good built-in array has
-        // nothing to gain here. Becomes a setting once there's UI for it.
+        // Following the default input can put AirPods into headset mode and
+        // degrade playback while dictating. Keep the existing built-in mic
+        // preference and avoid Bluetooth route instability.
         if let builtIn = Self.builtInInputDeviceID(), let unit = input.audioUnit {
             var device = builtIn
             AudioUnitSetProperty(
                 unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
                 &device, UInt32(MemoryLayout<AudioDeviceID>.size))
-            pinnedDevice = builtIn
+            facts.pinnedDevice = builtIn
         }
 
         // inputFormat, not outputFormat: after pinning a device onto the AUHAL,
@@ -244,10 +412,15 @@ final class AudioCapture {
         // the stale rate gets zero callbacks from CoreAudio, silently, forever:
         // that is what every "dictation heard nothing" today actually was.
         let inputFormat = input.inputFormat(forBus: 0)
-        tapRate = inputFormat.sampleRate
+        facts.tapRate = inputFormat.sampleRate
 
-        if let pinnedDevice, let hardwareRate = Self.nominalSampleRate(pinnedDevice),
-           hardwareRate != inputFormat.sampleRate {
+        // Snapshot the device facts here, on this background thread, so
+        // `captureHealth()` never has to ask CoreAudio from the main actor.
+        let device = facts.pinnedDevice ?? Self.defaultInputDeviceID()
+        facts.deviceName = device.flatMap(Self.deviceName)
+        facts.deviceRate = device.flatMap(Self.nominalSampleRate)
+
+        if let hardwareRate = facts.deviceRate, hardwareRate != inputFormat.sampleRate {
             Self.log.warning(
                 "tap rate \(inputFormat.sampleRate) still disagrees with hardware \(hardwareRate); capture may be dead")
         }
@@ -267,8 +440,13 @@ final class AudioCapture {
             throw MimiError.audioConversionUnsupported
         }
         converter.primeMethod = .none
-        self.converter = converter
-        maxPreRollFrames = AVAudioFrameCount(outputFormat.sampleRate * Self.preRollSeconds)
+
+        // This converter belongs to *this* tap, so the closure captures it
+        // instead of reading it back off `self`. A revival that swapped a
+        // shared converter mid-flight would leave the outgoing tap resampling
+        // at the new engine's rate for the moments before it is removed —
+        // garbled audio, from a race that simply cannot arise this way.
+        guard isCurrent(generation) else { throw CancellationError() }
 
         // installTap and start report misuse as NSExceptions, which would
         // otherwise unwind uncatchably through whatever async caller is on the
@@ -277,35 +455,37 @@ final class AudioCapture {
             // This block runs on a real-time audio thread. Keep it cheap;
             // yielding to an AsyncStream continuation is safe.
             input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-                guard let self else { return }
-                self.lock.lock()
-                self.lastBufferAt = CACurrentMediaTime()
-                self.lock.unlock()
-                guard let converted = self.convert(buffer) else { return }
+                guard let self, self.isCurrent(generation) else { return }
+                guard let converted = self.convert(buffer, using: converter) else { return }
 
                 self.lock.lock()
-                if let continuation = self.continuation {
-                    if self.isRecordingAudio { self.recorded.append(converted) }
+                // Release or a replacement engine may have raced conversion.
+                guard self.revival.isCurrent(generation), let continuation = self.continuation else {
                     self.lock.unlock()
-                    continuation.yield(AnalyzerInput(buffer: converted))
-                } else {
-                    self.preRoll.append(converted)
-                    self.preRollFrames += converted.frameLength
-                    while self.preRollFrames > self.maxPreRollFrames, !self.preRoll.isEmpty {
-                        self.preRollFrames -= self.preRoll.removeFirst().frameLength
-                    }
-                    self.lock.unlock()
+                    return
                 }
+                self.heartbeat.receivedBuffer(at: CACurrentMediaTime())
+                if self.firstBufferAt == nil {
+                    let duration = Double(converted.frameLength) / converted.format.sampleRate
+                    self.firstBufferAt = ContinuousClock.now - .seconds(duration)
+                }
+                self.recorded.append(converted)
+                continuation.yield(AnalyzerInput(buffer: converted))
+                self.lock.unlock()
             }
-            self.engine.prepare()
+            engine.prepare()
         }) {
             Self.log.error("tap install threw: \(objcError.localizedDescription)")
             throw objcError
         }
 
+        // Do not open hardware for a request released while device setup ran.
+        // A release racing the uninterruptible start itself is handled by publish,
+        // which rejects the stale engine and stops it on this background thread.
+        guard isCurrent(generation) else { throw CancellationError() }
         var startError: Error?
         if let objcError = MMCatchException({
-            do { try self.engine.start() } catch { startError = error }
+            do { try engine.start() } catch { startError = error }
         }) {
             Self.log.error("engine start threw: \(objcError.localizedDescription)")
             throw objcError
@@ -315,31 +495,21 @@ final class AudioCapture {
             throw startError
         }
 
-        // Seed the heartbeat so a dictation begun before the first buffer
-        // arrives doesn't read as a stall and tear the engine straight down.
-        lock.lock()
-        lastBufferAt = CACurrentMediaTime()
-        lock.unlock()
+        return facts
     }
 
-    /// Begin a recording: returns a stream that starts with the pre-roll and
-    /// continues with live audio until `stop()`.
+    /// Request capture. Hardware startup stays off the main thread; the stream
+    /// holds the first buffers while the recognizer prepares.
     func start() -> AsyncStream<AnalyzerInput> {
         let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
-
-        // Flush the pre-roll before publishing the continuation, inside the lock,
-        // so a live frame from the tap can't jump ahead of buffered audio.
         lock.lock()
-        recorded = preRoll
-        isRecordingAudio = true
-        for buffer in preRoll {
-            continuation.yield(AnalyzerInput(buffer: buffer))
-        }
-        preRoll.removeAll()
-        preRollFrames = 0
+        recorded.removeAll()
+        firstBufferAt = nil
+        heartbeat.reset()
+        revival.requestCapture()
         self.continuation = continuation
         lock.unlock()
-
+        scheduleRevival(reason: "hotkey pressed")
         return stream
     }
 
@@ -385,20 +555,35 @@ final class AudioCapture {
         return samples
     }
 
-    /// End the recording. The engine keeps running; audio goes back to the
-    /// pre-roll buffer.
+    /// Stop accepting audio immediately, cancel queued starts/retries, and
+    /// detach hardware before shutting it down off the main thread. No idle tap
+    /// or pre-roll remains. Recorded buffers survive until the caller drains them.
     func stop() {
         lock.lock()
+        revival.suspend()
         let continuation = self.continuation
         self.continuation = nil
-        isRecordingAudio = false
+        let old = engine
+        engine = nil
+        heartbeat.reset()
         lock.unlock()
         continuation?.finish()
+        Self.log.notice("capture stopped; microphone shutdown requested")
+        if let old {
+            DispatchQueue.global(qos: .userInitiated).async {
+                if let error = MMCatchException({
+                    old.stop()
+                    old.inputNode.removeTap(onBus: 0)
+                }) {
+                    Self.log.error("microphone shutdown failed: \(error.localizedDescription)")
+                } else {
+                    Self.log.notice("microphone stopped")
+                }
+            }
+        }
     }
 
-    private func convert(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let converter else { return nil }
-
+    private func convert(_ buffer: AVAudioPCMBuffer, using converter: AVAudioConverter) -> AVAudioPCMBuffer? {
         let ratio = converter.outputFormat.sampleRate / converter.inputFormat.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
         guard let output = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else {

@@ -49,6 +49,11 @@ final class HotkeyMonitor {
         return true
     }
 
+    /// Sleep can drop key-up. The first press after wake must start fresh.
+    func resetPressedState() {
+        isDown = false
+    }
+
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         // The system disables taps that take too long, silently. Without this the
         // hotkey just stops working with no error.
@@ -84,6 +89,9 @@ final class HotkeyMonitor {
 
         switch type {
         case .keyDown where keyCode == Self.spaceKeyCode && chordHeld:
+            // A startup failure or sleep must not turn keyboard autorepeat
+            // into repeated requests to reopen the microphone.
+            guard event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return nil }
             if !isDown {
                 isDown = true
                 onPress?()

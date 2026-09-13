@@ -5,10 +5,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG="${CONFIG:-release}"
+JOBS="${JOBS:-1}"
 BUNDLE_ID="com.zainsaeed.mimi"
 APP="build/Mimi.app"
 
-swift build -c "$CONFIG"
+nice -n 15 swift build -c "$CONFIG" -j "$JOBS" --product Mimi
 BIN="$(swift build -c "$CONFIG" --show-bin-path)/Mimi"
 
 # Quit a running copy so we can overwrite it. Note whether one was actually up,
@@ -58,16 +59,26 @@ echo "built $APP"
 if [ "$WAS_RUNNING" = "1" ] && [ "${RELAUNCH:-1}" = "1" ]; then
 	open "$APP"
 	sleep 1
-	AGE=$(ps -o etimes= -p "$(pgrep -x Mimi | head -1)" 2>/dev/null | tr -d ' ')
-	if [ -n "$AGE" ] && [ "$AGE" -le 15 ]; then
-		echo "relaunched Mimi (pid age ${AGE}s)"
+	# Any survivor was escalated to SIGKILL and re-checked above, so a process
+	# here is necessarily the new one — no age check needed.
+	#
+	# The age check this replaces used `ps -o etimes=`, a keyword macOS ps does
+	# not have. Under `set -e` the failing substitution killed the script right
+	# here, silently, so the Accessibility instructions below never printed on
+	# the one run that always needs them: the one that just reset TCC.
+	NEW_PID="$(pgrep -x Mimi | head -1 || true)"
+	if [ -n "$NEW_PID" ]; then
+		echo "relaunched Mimi (pid $NEW_PID)"
 	else
-		echo "WARNING: Mimi process age is '${AGE:-none}' — relaunch may have failed" >&2
+		echo "WARNING: Mimi did not come back after open" >&2
 	fi
 fi
 
 echo
-echo "Next: System Settings > Privacy & Security > Accessibility and switch Mimi on."
-echo "      The toggle will be off and unchecked — the reset above cleared it."
-echo "      Until it's on, the hotkey does nothing and the menu bar reads"
-echo "      \"Waiting for Accessibility permission…\"."
+if [ "${RESET_TCC:-1}" = "1" ]; then
+	echo "Next: System Settings > Privacy & Security > Accessibility and switch Mimi on."
+	echo "      Permission resets were requested above; macOS may also prompt for Microphone."
+else
+	echo "Existing permissions were left unchanged."
+	echo "If Mimi requests access, enable it in System Settings > Privacy & Security."
+fi

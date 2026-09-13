@@ -95,9 +95,9 @@ final class OverlayPanel {
     /// completing late can never orderOut a panel that was just re-shown.
     private var hideGeneration = 0
 
-    func show() {
+    func show(message: String = "Listening…") {
         hideGeneration += 1
-        render(committed: "", volatile: "Listening…", animated: false)
+        render(committed: "", volatile: message, animated: false)
         panel.alphaValue = 1
         panel.orderFrontRegardless()
         startPulse()
@@ -122,7 +122,7 @@ final class OverlayPanel {
         // If no preview ever arrived, "Listening…" is still on screen — but the
         // recording is over, and a stall past this point would wedge the panel
         // on a state the app already left. Say what's actually happening.
-        let text = current == "Listening…" ? "Transcribing…" : current
+        let text = (current == "Listening…" || current == "Speak now") ? "Transcribing…" : current
         render(committed: "", volatile: text, animated: true)
     }
 

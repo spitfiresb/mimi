@@ -98,9 +98,36 @@ Dates are when the work landed on `main`.
 | 2026-08-03 | **Stage 2 first cut — formatting layer live.** Foundation Models pass with invention-ratio guard, verbatim toggle, prewarm |
 | 2026-08-04..05 | Overlay redesign, sleep/wake survival, press/release race fix, hot-mic pre-roll, streaming cleanup, instrumentation |
 | 2026-08-06 | PR #1 merged — Stages 1–2 on `main`. **Press-release pivot:** this roadmap rewritten around the Core ML / ANE / benchmark direction |
+| 2026-09-13 | On-demand microphone capture, background recovery, lazy formatter sessions, and lower-concurrency builds; 46 tests and live capture/release checks passed |
 
-**Current state:** MVP on system frameworks, genuinely usable, 42 logged
-dictations. Act II begins.
+**Current state (2026-09-13):** Parakeet-int8 supplies the default transcript;
+Apple supplies preview/fallback. The microphone runs only during an explicit
+dictation request. Streaming Parakeet and measured battery efficiency remain open.
+
+### Battery follow-up
+
+**The main identified idle issue is fixed: always-on microphone capture.**
+Overall battery consumption remains an open measurement task; reduced microphone
+activity is not a measured battery-life improvement. See [BATTERY_ANALYSIS.md](BATTERY_ANALYSIS.md).
+
+- [x] Remove idle capture/resampling and pre-roll. Start on hotkey press, show
+      “Speak now” when ready, stop on release, and keep capture off after wake.
+- [x] Cancel stale starts/retries and quick taps; add first-buffer recovery grace
+      to prevent configuration notifications from causing a restart loop.
+- [x] Create formatter sessions only for text needing cleanup; skip launch
+      prewarming when cleanup is disabled.
+- [ ] Measure matched Mimi-quit versus Mimi-idle power on battery, accounting for
+      shared Apple audio/model services; report startup separately.
+- [ ] Measure short and long dictations for energy, peak memory, and latency.
+- [ ] Investigate cleanup waits with unchanged output and work continuing after
+      timeout. Nine recent dictations accumulated about 13 seconds of formatting
+      stage waits without changed output; these are elapsed times, not energy.
+
+September 13 live checks: microphone startup 194–521 ms, shutdown 8–24 ms after
+release, quick-tap cancellation, and no automatic capture restart during the
+user's sleep/wake check. In roughly five monitored minutes, capture was requested
+for about 47 seconds (16% of the window). Neither this fraction nor the process
+CPU/RAM samples establish battery percentage, watt-hours, or all-day savings.
 
 ---
 
@@ -113,7 +140,8 @@ leaves behind that Act II builds on:
 - `transcripts.jsonl` — every real dictation, growing daily. Becomes the eval set.
 - `SpeechTranscriber` fully wired — becomes the baseline arm of every benchmark.
 - The formatting layer — engine-agnostic; whatever ASR wins feeds it unchanged.
-- The hot `AVAudioEngine` + 0.5s pre-roll — the thing the ring buffer replaces.
+- On-demand `AVAudioEngine` capture (September 13): no idle capture or pre-roll;
+  show readiness before speech. Any future ring buffer must preserve that policy.
 
 ---
 
@@ -204,13 +232,15 @@ command that reproduces it.
 
 ### Stage 6 — The audio path: ring buffer + VAD
 
-Replace the pre-roll with a real systems structure.
+Improve buffering during active dictation. The September 13 on-demand capture
+policy takes precedence over this stage's original always-hot pre-roll design:
+idle and wake must not start the microphone.
 
 - [ ] Single-producer single-consumer lock-free ring buffer (atomic head/tail,
       power-of-two capacity) — mic render thread writes, engine consumer reads,
       no locks on the audio thread ever
-- [ ] Pre-roll becomes a property of the buffer (read pointer trails write by
-      0.5s) instead of a separate copy path
+- [ ] Buffer audio only within an explicit capture request; preserve first
+      buffers during recognizer startup without opening the microphone while idle
 - [ ] On-device VAD gating what reaches the model: start with energy +
       hangover, evaluate Silero-VAD-CoreML if energy proves too crude
 - [ ] Harness gains a VAD metric: false-trigger rate and clipped-word rate
@@ -313,9 +343,10 @@ Unscheduled. Pull forward if something proves important.
   lands in the overlay.
 - **A dead menu bar app is indistinguishable from a broken hotkey.** Suspect "is
   it even running?" before debugging the event tap.
-- **On-demand mic start eats the head of the utterance** (~1s hardware spin-up).
-  Engine runs from launch; idle audio goes to a 0.5s pre-roll flushed into the
-  stream at keypress. *(Stage 6 rebuilds this as the ring buffer.)*
+- **Cold mic startup needs an explicit readiness cue** (~1s hardware spin-up
+  observed historically). As of September 13, show “Starting microphone…” until
+  audio arrives and the recognizer is ready, then “Speak now”. Release stops
+  hardware and invalidates pending starts/retries; wake leaves capture off.
 - **The login item registers the bundle's current path** — today `build/`, which
   `bundle.sh` recreates every run. The app needs `/Applications` before
   launch-at-login can be trusted.

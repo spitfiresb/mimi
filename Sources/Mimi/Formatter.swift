@@ -61,9 +61,6 @@ actor Formatter {
         "o'clock", "slash", "dot",
     ]
 
-    /// Set once prewarm has confirmed the model is available and loaded.
-    private var ready = false
-
     var isAvailable: Bool {
         SystemLanguageModel.default.availability == .available
     }
@@ -73,16 +70,17 @@ actor Formatter {
     func prewarm() {
         guard isAvailable else { return }
         LanguageModelSession(instructions: Self.instructions).prewarm()
-        ready = true
     }
 
     /// One conversation per utterance: fresh enough that history never
     /// accumulates across dictations (the all-day slowdown), long-lived enough
     /// that sentences after the first reuse the processed instruction prefix.
-    /// Prewarm it at keypress and the instruction cost is paid while the user
-    /// is still speaking.
-    static func makeUtteranceSession() -> LanguageModelSession {
-        let session = LanguageModelSession(instructions: instructions)
+    /// Create it only after routing finds a sentence that needs cleanup.
+    /// Availability is checked here so enabling cleanup after a launch in
+    /// verbatim mode works without a bootstrap prewarm.
+    func makeUtteranceSession() -> LanguageModelSession? {
+        guard isAvailable else { return nil }
+        let session = LanguageModelSession(instructions: Self.instructions)
         session.prewarm()
         return session
     }
@@ -95,7 +93,7 @@ actor Formatter {
         suspectTokens: Set<String>,
         session: LanguageModelSession
     ) async -> String {
-        guard ready, Self.needsCleaning(sentence, suspectTokens: suspectTokens) else {
+        guard isAvailable, Self.needsCleaning(sentence, suspectTokens: suspectTokens) else {
             return sentence
         }
 
@@ -165,18 +163,16 @@ actor Formatter {
     }
 }
 
-/// Formats the utterance *while it's being spoken*. The recognizer hands over
-/// finalized chunks mid-dictation; complete sentences are cleaned in the
-/// background as the user speaks the next one. Generation runs ~8 words/s and
-/// speech ~2–3 words/s, so the model keeps pace and release-to-paste shrinks to
-/// roughly one sentence's worth of work.
+/// Routes and formats incoming text sentence by sentence. The app currently
+/// feeds the selected transcript at release; chunked input is also supported.
+/// Text that needs no cleanup passes through without creating a model session.
 actor FormatPipeline {
     private let formatter: Formatter
     private let onProgress: @Sendable (String) -> Void
 
-    /// Created (and prewarmed) at keypress, shared by every sentence in this
-    /// utterance, discarded with the pipeline.
-    private let session = Formatter.makeUtteranceSession()
+    /// Created for the first sentence needing cleanup, reused for the rest of
+    /// this utterance, and discarded with the pipeline.
+    private var session: LanguageModelSession?
 
     private var suspect: Set<String> = []
     private var pending = ""
@@ -238,6 +234,20 @@ actor FormatPipeline {
             await previous?.value
             for sentence in sentences {
                 if cancelled { return }
+                guard Formatter.needsCleaning(sentence, suspectTokens: suspectSnapshot) else {
+                    append(sentence)
+                    continue
+                }
+                if session == nil {
+                    session = await formatter.makeUtteranceSession()
+                }
+                // Session creation crosses actors; cancellation may arrive
+                // while we wait. Don't start inference after giving up.
+                if cancelled { return }
+                guard let session else {
+                    append(sentence)
+                    continue
+                }
                 let cleaned = await formatter.cleanSentence(
                     sentence, suspectTokens: suspectSnapshot, session: session
                 )

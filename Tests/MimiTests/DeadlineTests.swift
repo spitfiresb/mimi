@@ -58,7 +58,7 @@ final class DeadlineTests: XCTestCase {
     /// like a successful dictation that silently lost its second half.
     func testCancelledFormattingYieldsNilRatherThanAPartialTranscript() async {
         let pipeline = FormatPipeline(formatter: Formatter()) { _ in }
-        await pipeline.feed("One sentence. Two sentence. Three sentence.", spans: [])
+        await pipeline.feed("First sentence. Next sentence. Last sentence.", spans: [])
         await pipeline.cancel()
         let result = await pipeline.finish()
         XCTAssertNil(result, "a cut-short format pass must not hand back half a transcript")
@@ -93,13 +93,13 @@ final class DeadlineTests: XCTestCase {
         XCTAssertEqual(result, "in time")
     }
 
-    /// And the pass that isn't cut off still returns its text. (The model is
-    /// unavailable in a test process, so every sentence routes straight
-    /// through — which is exactly the pass-through path this pins.)
+    /// And the pass that isn't cut off still returns its text. These sentences
+    /// have no cleanup triggers, so lazy routing passes them through without
+    /// creating a model session, even on a machine where the model is available.
     func testUncancelledFormattingReturnsItsText() async {
         let pipeline = FormatPipeline(formatter: Formatter()) { _ in }
-        await pipeline.feed("One sentence. Two sentence.", spans: [])
+        await pipeline.feed("First sentence. Next sentence.", spans: [])
         let result = await pipeline.finish()
-        XCTAssertEqual(result, "One sentence. Two sentence.")
+        XCTAssertEqual(result, "First sentence. Next sentence.")
     }
 }

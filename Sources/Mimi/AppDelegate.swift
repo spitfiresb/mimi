@@ -63,6 +63,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// overlay stranded on screen.
     private var startTask: Task<TranscriptionSession?, Never>?
     private var isRecording = false
+    private var recordingReady = false
+    private var isProcessing = false
+    private var recordingGeneration = 0
 
     /// Captured when recording starts, so the log records where the text was
     /// headed rather than wherever focus ended up afterwards.
@@ -179,30 +182,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Self.log.notice("bootstrap: Accessibility granted")
         }
 
+        let format: AVAudioFormat
         do {
             try await engine.prepare { message in
                 Task { @MainActor in self.setState(symbol: "mic", status: message) }
             }
-            // Mic goes hot now and stays hot — starting it at keypress loses the
-            // first second of speech to hardware spin-up.
-            guard let format = await engine.analyzerFormat else { throw MimiError.notPrepared }
-            try audio.prepare(outputFormat: format)
-
-            // Sleep kills the engine; wake must revive it or the next dictation
-            // records silence.
-            NSWorkspace.shared.notificationCenter.addObserver(
-                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated { _ = self?.audio.ensureRunning() }
-            }
+            guard let analyzerFormat = await engine.analyzerFormat else { throw MimiError.notPrepared }
+            format = analyzerFormat
         } catch {
+            // No transcriber means no dictation, so this one is still fatal to
+            // bootstrap. An unavailable *mic* is not — see below.
             setState(symbol: "mic.slash", status: "Error: \(error.localizedDescription)")
             return
         }
 
-        // Warm the formatter alongside the transcriber; cold start is ~3s,
-        // warm is ~0.5s. Fire-and-forget — dictation must not wait on it.
-        Task { await formatter.prewarm() }
+        // Configuration does not open the mic. Only a held hotkey requests audio.
+        audio.prepare(outputFormat: format)
+
+        // Sleep, display sleep and session switching cancel a held dictation.
+        // Only the next explicit press can reopen the mic after wake.
+        let notifications = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
+                     NSWorkspace.sessionDidResignActiveNotification] {
+            notifications.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.hotkey.resetPressedState()
+                    self?.cancelRecordingForSleep()
+                }
+            }
+        }
+
+        // Warm the formatter only when cleanup is enabled. Launching in
+        // verbatim mode should not load a model it will never use; enabling
+        // cleanup later creates a session on the first sentence needing it.
+        if !UserDefaults.standard.bool(forKey: Self.verbatimKey) {
+            Task { await formatter.prewarm() }
+        }
 
         // Load Parakeet off the critical path. If anything fails (missing
         // packages, bad models dir) the app quietly stays on Apple's engine.
@@ -226,28 +241,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         Self.log.notice("bootstrap: ready, hotkey installed")
-        setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
+        setState(symbol: "mic", status: "Mic off — hold ⌃⌥Space to start")
     }
 
     // MARK: - Recording
 
     private func beginRecording() async {
-        guard !isRecording else {
-            Self.log.warning("press ignored: already recording")
-            return
-        }
-
-        // Refuse to fake a recording the mic can't feed. Showing "Listening" and
-        // then eating the dictation is the worst outcome this app can produce;
-        // an honest error is recoverable, silence is a bug report (2026-08-11).
-        guard audio.ensureRunning() else {
-            Self.log.error("press refused: audio engine unavailable")
-            setState(symbol: "mic.slash", status: "Mic unavailable — check input device")
-            return
-        }
-
-        Self.log.notice("beginRecording")
+        guard !isRecording, !isProcessing else { return }
+        Self.log.notice("beginRecording: starting microphone")
+        recordingGeneration += 1
+        let generation = recordingGeneration
         isRecording = true
+        recordingReady = false
 
         let frontmost = NSWorkspace.shared.frontmostApplication
         context = RecordingContext(
@@ -255,61 +260,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appBundleID: frontmost?.bundleIdentifier,
             appName: frontmost?.localizedName
         )
+        setState(symbol: "mic", status: "Starting microphone…")
+        overlay.show(message: "Starting microphone…")
 
-        setState(symbol: "mic.fill", status: "Listening…")
-        overlay.show()
-
-        // Last line of defence against a recording that never ends. Every known
-        // route to a wedged "Listening" panel is now handled individually, but
-        // they all reduce to the same thing — a key-up that never arrives — and
-        // the user has no way out of it when it happens. A dictation this long
-        // is not a real one, so ending it costs nothing and the transcript of
-        // whatever was captured still lands.
+        // Startup has its own deadline, even if the user keeps holding the key.
+        // Stop requesting hardware on failure; no retry may outlive this press.
         watchdog?.cancel()
         watchdog = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.maxRecordingSeconds))
-            guard !Task.isCancelled else { return }
-            await self?.endRecording()
+            try? await Task.sleep(for: .seconds(Self.sessionStartDeadlineSeconds))
+            guard !Task.isCancelled, let self,
+                  self.recordingGeneration == generation, self.isRecording, !self.recordingReady else { return }
+            self.failRecordingStart("Microphone didn't start — release and try again", generation: generation)
         }
 
-        // Capture audio from the first instant; the stream buffers while the
-        // session spins up. (Engine health was already proven above, before the
-        // panel went up.)
         let stream = audio.start()
-
         previewStats = PreviewStats()
         let pressAt = ContinuousClock.now
-        // Audio time zero is the head of the pre-roll, half a second before the
-        // press.
-        let audioEpoch = pressAt - .milliseconds(500)
-
-        // Formatting now happens at release on whichever engine's text wins
-        // (Parakeet's arrives all at once, so there's nothing to pre-clean
-        // mid-speech; Apple's chunked-feed optimization went with it).
         startTask = Task { [weak self] in
             guard let self else { return nil }
+            guard await audio.waitUntilReady(), !Task.isCancelled,
+                  self.isRecording, self.recordingGeneration == generation,
+                  let audioEpoch = audio.captureEpoch else { return nil }
+
+            var session: TranscriptionSession?
             do {
-                let (session, _) = try await engine.makeSession()
-                try await session.start(
+                let (prepared, _) = try await engine.makeSession()
+                session = prepared
+                guard !Task.isCancelled, self.isRecording, self.recordingGeneration == generation else {
+                    await prepared.abort()
+                    return nil
+                }
+                try await prepared.start(
                     stream,
                     audioEpoch: audioEpoch,
                     onFinalResult: { _, _ in }
                 ) { [weak self] committed, volatile, lagMs in
                     Task { @MainActor in
-                        guard let self, self.isRecording else { return }
+                        guard let self, self.isRecording, self.recordingReady,
+                              self.recordingGeneration == generation else { return }
                         self.previewStats.record(lagMs: lagMs, sincePress: pressAt)
-                        if committed.isEmpty && volatile.isEmpty {
-                            self.overlay.update(committed: "", volatile: "Listening…")
-                        } else {
-                            self.overlay.update(committed: committed, volatile: volatile)
-                        }
+                        self.overlay.update(
+                            committed: committed,
+                            volatile: committed.isEmpty && volatile.isEmpty ? "Speak now" : volatile)
                     }
                 }
+                guard !Task.isCancelled, self.isRecording, self.recordingGeneration == generation else {
+                    await prepared.abort()
+                    return nil
+                }
+                recordingReady = true
                 previewStats.startupMs = Int((ContinuousClock.now - pressAt) / .milliseconds(1))
-                return session
+                Self.log.notice("microphone ready: speak now (startup \(self.previewStats.startupMs ?? 0)ms)")
+                setState(symbol: "mic.fill", status: "Listening — release to finish")
+                overlay.update(committed: "", volatile: "Speak now")
+                watchdog?.cancel()
+                watchdog = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(Self.maxRecordingSeconds))
+                    guard !Task.isCancelled, let self, self.recordingGeneration == generation else { return }
+                    await self.endRecording()
+                }
+                return prepared
             } catch {
-                setState(symbol: "mic", status: "Error: \(error.localizedDescription)")
+                failRecordingStart("Microphone unavailable — release and try again", generation: generation)
+                await session?.abort()
                 return nil
+            }
+        }
+    }
+
+    private func failRecordingStart(_ message: String, generation: Int) {
+        guard recordingGeneration == generation, isRecording else { return }
+        Self.log.error("recording startup failed; stopping microphone")
+        cancelRecordingForSleep()
+        setState(symbol: "mic.slash", status: message)
+        overlay.show(message: message)
+    }
+
+    /// Also used for a release before readiness. Late startup completions are
+    /// cancelled and generation-guarded, so they cannot revive capture or the UI.
+    private func cancelRecordingForSleep() {
+        recordingGeneration += 1
+        isRecording = false
+        recordingReady = false
+        watchdog?.cancel()
+        watchdog = nil
+        let pending = startTask
+        startTask = nil
+        pending?.cancel()
+        audio.stop()
+        _ = audio.takeRecordedSamples16k()
+        context = nil
+        overlay.hide()
+        if !isProcessing { setState(symbol: "mic", status: "Mic off — hold ⌃⌥Space to start") }
+        if let pending {
+            Task {
+                if let session = await pending.value { await session.abort() }
             }
         }
     }
@@ -331,6 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func endRecording() async {
         Self.log.notice("endRecording: isRecording=\(self.isRecording)")
+        guard !isProcessing else { return }
         guard isRecording else {
             // A release with nothing recording means the press and release
             // transitions raced, or the press was lost. Either way the panel may
@@ -338,10 +384,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // be put back — a stuck panel is indistinguishable from a dead
             // hotkey, and the user has no way out of it.
             overlay.hide()
-            setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
+            setState(symbol: "mic", status: "Mic off — hold ⌃⌥Space to start")
+            return
+        }
+        guard recordingReady else {
+            Self.log.notice("released before microphone ready; startup cancelled")
+            cancelRecordingForSleep()
             return
         }
         isRecording = false
+        recordingReady = false
+        isProcessing = true
+        defer { isProcessing = false }
+        // Release closes the mic before any recognizer/formatter wait.
+        audio.stop()
         watchdog?.cancel()
         watchdog = nil
         let context = self.context
@@ -372,9 +428,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         setState(symbol: "mic", status: "Transcribing…")
         overlay.waiting()
-
-        // Finishing the audio stream is what lets finalize() return.
-        audio.stop()
 
         // Parakeet transcribes the same audio the analyzer heard, concurrently
         // with Apple's finalization. ~36ms/15s window on the ANE, so the race
@@ -535,14 +588,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
         }
         if audioSeconds == 0 {
-            // The tap delivered nothing at all — the engine was dead for this
-            // whole dictation. ensureRunning's stall detection rebuilds it on
-            // the next press; say so instead of a silent "Ready" that reads as
-            // the app eating the dictation.
-            audio.ensureRunning()
-            setState(symbol: "mic.slash", status: "Mic heard nothing — restarted, try again")
+            setState(symbol: "mic.slash", status: "Mic heard nothing — try again")
         } else {
-            setState(symbol: "mic", status: "Ready — hold ⌃⌥Space")
+            setState(symbol: "mic", status: "Mic off — hold ⌃⌥Space to start")
         }
     }
 
