@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var launchAtLoginItem: NSMenuItem?
     private var formattingItem: NSMenuItem?
 
-    /// Stored inverted so formatting defaults to on without a registration dance.
+    /// Cleanup is opt-in; registered defaults preserve explicit user preferences.
     private static let verbatimKey = "verbatimMode"
 
     /// How long the formatting pass may hold the paste. Short dictations finish
@@ -36,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let audio = AudioCapture()
     private let hotkey = HotkeyMonitor()
     private let overlay = OverlayPanel()
+    private var overlayReveal: Task<Void, Never>?
     private let formatter = Formatter()
 
     /// The Stage 5 default: Parakeet-int8 on the Neural Engine transcribes the
@@ -77,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var context: RecordingContext?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: [Self.verbatimKey: true])
         buildMenuBarItem()
         enableLaunchAtLoginOnFirstRun()
         setState(symbol: "mic", status: "Starting…")
@@ -102,9 +104,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         let menu = NSMenu()
-        let hint = NSMenuItem(title: "Hold ⌃⌥Space to dictate", action: nil, keyEquivalent: "")
+        let hint = NSMenuItem(title: "Hold Fn to dictate", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
+        let lockHint = NSMenuItem(title: "Double-press Fn to lock · press Fn to finish", action: nil, keyEquivalent: "")
+        lockHint.isEnabled = false
+        menu.addItem(lockHint)
         menu.addItem(.separator())
 
         let formatting = NSMenuItem(
@@ -196,7 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        // Configuration does not open the mic. Only a held hotkey requests audio.
+        // Configuration does not open the mic. Only an explicit gesture does.
         audio.prepare(outputFormat: format)
 
         // Sleep, display sleep and session switching cancel a held dictation.
@@ -231,7 +236,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        hotkey.onPress = { [weak self] in Task { @MainActor in await self?.beginRecording() } }
+        hotkey.canStart = { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return false }
+                return !self.isRecording && !self.isProcessing
+            }
+        }
+        // Fn transitions run on the main run loop. Apply starts/cancellations
+        // synchronously so a quick first tap cannot race the second press.
+        hotkey.onPress = { [weak self] locked in
+            MainActor.assumeIsolated { self?.beginRecording(locked: locked) }
+        }
+        hotkey.onCancel = { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.cancelRecordingForSleep(resetHotkey: false)
+            }
+        }
         hotkey.onRelease = { [weak self] in Task { @MainActor in await self?.endRecording() } }
 
         guard hotkey.start() else {
@@ -241,12 +262,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         Self.log.notice("bootstrap: ready, hotkey installed")
-        setState(symbol: "mic", status: "Mic off — hold ⌃⌥Space to start")
+        setState(symbol: "mic", status: "Mic off — hold Fn or double-press Fn")
     }
 
     // MARK: - Recording
 
-    private func beginRecording() async {
+    private func beginRecording(locked: Bool) {
         guard !isRecording, !isProcessing else { return }
         Self.log.notice("beginRecording: starting microphone")
         recordingGeneration += 1
@@ -261,7 +282,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appName: frontmost?.localizedName
         )
         setState(symbol: "mic", status: "Starting microphone…")
-        overlay.show(message: "Starting microphone…")
+        overlayReveal?.cancel()
+        overlay.hideImmediately()
+        overlay.setLocked(locked)
 
         // Startup has its own deadline, even if the user keeps holding the key.
         // Stop requesting hardware on failure; no retry may outlive this press.
@@ -311,12 +334,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 recordingReady = true
                 previewStats.startupMs = Int((ContinuousClock.now - pressAt) / .milliseconds(1))
                 Self.log.notice("microphone ready: speak now (startup \(self.previewStats.startupMs ?? 0)ms)")
-                setState(symbol: "mic.fill", status: "Listening — release to finish")
-                overlay.update(committed: "", volatile: "Speak now")
+                setState(symbol: hotkey.isLocked ? "lock.fill" : "mic.fill",
+                         status: hotkey.isLocked ? "Hands-free" : "Listening — release Fn to finish")
+                overlayReveal = Task { [weak self] in
+                    guard let self else { return }
+                    // A short first tap must never flash a panel, even if the
+                    // microphone starts unusually quickly. Locked recordings
+                    // can appear as soon as audio and recognition are ready.
+                    if !self.hotkey.isLocked {
+                        let elapsed = Double((ContinuousClock.now - pressAt) / .milliseconds(1)) / 1000
+                        let remaining = max(0, FnGesture.tapDuration - elapsed)
+                        if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
+                    }
+                    guard !Task.isCancelled, self.isRecording, self.recordingReady,
+                          self.recordingGeneration == generation else { return }
+                    self.overlay.show(message: "Speak now")
+                }
                 watchdog?.cancel()
                 watchdog = Task { [weak self] in
                     try? await Task.sleep(for: .seconds(Self.maxRecordingSeconds))
                     guard !Task.isCancelled, let self, self.recordingGeneration == generation else { return }
+                    self.hotkey.resetPressedState(keepingKeyDown: true)
                     await self.endRecording()
                 }
                 return prepared
@@ -338,7 +376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Also used for a release before readiness. Late startup completions are
     /// cancelled and generation-guarded, so they cannot revive capture or the UI.
-    private func cancelRecordingForSleep() {
+    private func cancelRecordingForSleep(resetHotkey: Bool = true) {
+        if resetHotkey { hotkey.resetPressedState(keepingKeyDown: true) }
         recordingGeneration += 1
         isRecording = false
         recordingReady = false
@@ -348,10 +387,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startTask = nil
         pending?.cancel()
         audio.stop()
+        overlayReveal?.cancel()
+        overlayReveal = nil
+        overlay.setLocked(false)
         _ = audio.takeRecordedSamples16k()
         context = nil
         overlay.hide()
-        if !isProcessing { setState(symbol: "mic", status: "Mic off — hold ⌃⌥Space to start") }
+        if !isProcessing { setState(symbol: "mic", status: "Mic off — hold Fn or double-press Fn") }
         if let pending {
             Task {
                 if let session = await pending.value { await session.abort() }
@@ -375,6 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previewStats = PreviewStats()
 
     private func endRecording() async {
+        let releasedAt = ContinuousClock.now
         Self.log.notice("endRecording: isRecording=\(self.isRecording)")
         guard !isProcessing else { return }
         guard isRecording else {
@@ -384,7 +427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // be put back — a stuck panel is indistinguishable from a dead
             // hotkey, and the user has no way out of it.
             overlay.hide()
-            setState(symbol: "mic", status: "Mic off — hold ⌃⌥Space to start")
+            setState(symbol: "mic", status: "Mic off — hold Fn or double-press Fn")
             return
         }
         guard recordingReady else {
@@ -395,6 +438,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isRecording = false
         recordingReady = false
         isProcessing = true
+        overlayReveal?.cancel()
+        overlayReveal = nil
         defer { isProcessing = false }
         // Release closes the mic before any recognizer/formatter wait.
         audio.stop()
@@ -414,6 +459,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // very long time (2026-08-11).
         let pending = startTask
         startTask = nil
+        let samples = audio.takeRecordedSamples16k()
+        let audioSeconds = Double(samples.count) / MelFrontend.sampleRate
+        let signal = SilenceGate.assess(samples)
+        let health = audio.captureHealth()
+        let audioHealth = TranscriptEntry.AudioHealth(
+            device: health.device, deviceRate: health.deviceRate, tapRate: health.tapRate,
+            peak: signal.peak, seconds: audioSeconds,
+            maxFrameRMS: signal.maxFrameRMS, activeMs: signal.activeMs,
+            longestActiveMs: signal.longestActiveMs, silenceSkipped: !signal.hasSignal)
+        if !signal.hasSignal {
+            // Do not finalize either recognizer, format, or touch the clipboard.
+            // Apple's live preview may already have guessed words from noise;
+            // those guesses are not evidence that the user spoke.
+            overlay.hideImmediately()
+            setState(symbol: "mic", status: "Mic off — hold Fn or double-press Fn")
+            Self.log.notice("silence skipped: peak=\(signal.peak) maxRMS=\(signal.maxFrameRMS) sustained=\(signal.longestActiveMs)ms")
+            pending?.cancel()
+            Task {
+                if let session = await pending?.value { await session.abort() }
+            }
+            await log("", formatted: nil, recognition: [],
+                      timings: .init(finalizeMs: 0, formatMs: 0, settleMs: 0, insertMs: 0,
+                                     startupMs: previewStats.startupMs,
+                                     cleanupEnabled: !UserDefaults.standard.bool(forKey: Self.verbatimKey)),
+                      audio: audioHealth, context: context)
+            return
+        }
         let session = await Self.abandoning(after: Self.sessionStartDeadlineSeconds) {
             await pending?.value
         } ?? nil
@@ -429,30 +501,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setState(symbol: "mic", status: "Transcribing…")
         overlay.waiting()
 
-        // Parakeet transcribes the same audio the analyzer heard, concurrently
-        // with Apple's finalization. ~36ms/15s window on the ANE, so the race
-        // costs nothing; the winner is decided below.
-        let samples = audio.takeRecordedSamples16k()
-        let audioSeconds = Double(samples.count) / MelFrontend.sampleRate
-        let parakeetTask: Task<String?, Never>? = (parakeetReady && !samples.isEmpty)
+        // Start Parakeet immediately. Apple finalization will run concurrently
+        // as a bounded fallback, but cannot delay a successful Parakeet result.
+        let parakeetTask: Task<EngineTranscript?, Never>? = (parakeetReady && !samples.isEmpty)
             ? Task.detached(priority: .userInitiated) { [parakeet] in
-                try? parakeet.transcribe(samples16k: samples)
+                let startedAt = ContinuousClock.now
+                let text = (try? parakeet.transcribe(samples16k: samples)) ?? ""
+                return EngineTranscript(
+                    text: text,
+                    runtimeMs: Int((ContinuousClock.now - startedAt) / .milliseconds(1)))
             }
             : nil
-
-        // Capture-side health for the log. A dictation that "heard nothing"
-        // looks identical to one that heard silence; the peak level and the
-        // device/tap rates are what tell those apart afterwards.
-        var peak: Float = 0
-        for sample in samples { peak = max(peak, abs(sample)) }
-        let health = audio.captureHealth()
-        let audioHealth = TranscriptEntry.AudioHealth(
-            device: health.device,
-            deviceRate: health.deviceRate,
-            tapRate: health.tapRate,
-            peak: peak,
-            seconds: audioSeconds
-        )
+        let cleanupEnabled = !UserDefaults.standard.bool(forKey: Self.verbatimKey)
 
         let clock = ContinuousClock()
         var stamp = clock.now
@@ -462,38 +522,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return Int((now - stamp) / .milliseconds(1))
         }
 
-        // Apple's finalization can hang outright: finish() awaits a collector
-        // that only ends when the analyzer delivers end-of-stream, and a broken
-        // session never does. The old withTimeout threw on schedule, but its
-        // task group still waited for the hung child on the way out — so
-        // endRecording suspended here forever, panel up, main thread idle,
-        // nothing on any thread for a sample to even see (2026-08-11, caught
-        // live). Abandon the wait instead, and tear the session down on the way
-        // past: a hung Apple finalize must not cost the dictation when Parakeet
-        // has the same audio.
-        let appleResult = await Self.abandoning(after: 10) {
-            try? await session.finish()
-        }
-        if appleResult == nil { await session.abort() }
-        let finalizeMs = lap()
-        let appleText = appleResult?.text ?? ""
-        let recognition = appleResult?.recognition ?? []
-
-        // Never spend more wall clock on the decode than the audio itself
-        // lasted. A decode slower than 1x real time is pathology, not
-        // slowness — measured worst case is 0.50x on a 59s dictation — and
-        // Apple's text is already in hand as the fallback. Drop the floor
-        // or the multiplier to trade transcript quality for a faster paste.
-        let parakeetText = await Self.awaitValue(
-            of: parakeetTask, deadline: max(10, audioSeconds))
-        let parakeetMs = lap()
-
-        // Parakeet's text is the default; Apple's is the fallback for an
-        // empty or failed decode. Both are logged either way.
-        let appleTrimmed = appleText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parakeetTrimmed = parakeetText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let usedParakeet = !parakeetTrimmed.isEmpty
-        let trimmed = usedParakeet ? parakeetTrimmed : appleTrimmed
+        let selection = await TranscriptSelector.select(
+            preferred: parakeetTask,
+            preferredDeadline: max(10, audioSeconds),
+            fallback: {
+                let startedAt = ContinuousClock.now
+                guard let result = try? await session.finish() else { return nil }
+                return EngineTranscript(
+                    text: result.text,
+                    runtimeMs: Int((ContinuousClock.now - startedAt) / .milliseconds(1)),
+                    recognition: result.recognition)
+            },
+            cancelFallback: { await session.abort() })
+        let finalizeMs = selection.fallbackWaitMs
+        let parakeetMs = selection.parakeetWaitMs
+        let appleTrimmed = selection.apple?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let recognition = selection.apple?.recognition ?? []
+        let usedParakeet = selection.usedParakeet
+        let trimmed = selection.text
+        // The two waits above partition selection time; formatting begins now.
+        stamp = clock.now
+        Self.log.notice("transcript selected: parakeet=\(usedParakeet) preferredWait=\(parakeetMs)ms fallbackWait=\(finalizeMs)ms cleanup=\(cleanupEnabled)")
 
         if trimmed.isEmpty {
             overlay.hide()
@@ -513,14 +562,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     parakeetMs: parakeetMs,
                     startupMs: previewStats.startupMs,
                     firstPreviewMs: previewStats.firstPreviewMs,
-                    maxPreviewLagMs: previewStats.maxPreviewLagMs
+                    maxPreviewLagMs: previewStats.maxPreviewLagMs,
+                    parakeetTotalMs: selection.parakeetTotalMs,
+                    appleFinalizeMs: selection.apple?.runtimeMs,
+                    releaseToPasteMs: nil,
+                    cleanupEnabled: cleanupEnabled
                 ),
                 audio: audioHealth,
                 context: context
             )
         } else {
             var output = trimmed
-            if !UserDefaults.standard.bool(forKey: Self.verbatimKey),
+            if cleanupEnabled,
                trimmed.split(separator: " ").count >= Formatter.minimumWords {
                 let pipeline = FormatPipeline(formatter: formatter) { [weak self] partial in
                     Task { @MainActor in
@@ -565,11 +618,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let pasteTarget = NSWorkspace.shared.frontmostApplication?.localizedName
             await TextInserter.insert(output)
             let insertMs = lap()
+            let releaseToPasteMs = Int((ContinuousClock.now - releasedAt) / .milliseconds(1))
+            Self.log.notice("paste posted: releaseToPaste=\(releaseToPasteMs)ms parakeetTotal=\(selection.parakeetTotalMs ?? -1)ms")
 
             await log(
                 trimmed,
                 engine: usedParakeet ? "parakeet-int8" : "apple",
-                appleRaw: usedParakeet ? appleTrimmed : nil,
+                appleRaw: usedParakeet && !appleTrimmed.isEmpty ? appleTrimmed : nil,
                 formatted: output == trimmed ? nil : output,
                 recognition: recognition,
                 timings: .init(
@@ -580,7 +635,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     parakeetMs: parakeetMs,
                     startupMs: previewStats.startupMs,
                     firstPreviewMs: previewStats.firstPreviewMs,
-                    maxPreviewLagMs: previewStats.maxPreviewLagMs
+                    maxPreviewLagMs: previewStats.maxPreviewLagMs,
+                    parakeetTotalMs: selection.parakeetTotalMs,
+                    appleFinalizeMs: selection.apple?.runtimeMs,
+                    releaseToPasteMs: releaseToPasteMs,
+                    cleanupEnabled: cleanupEnabled
                 ),
                 pasteTarget: pasteTarget,
                 audio: audioHealth,
@@ -590,7 +649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if audioSeconds == 0 {
             setState(symbol: "mic.slash", status: "Mic heard nothing — try again")
         } else {
-            setState(symbol: "mic", status: "Mic off — hold ⌃⌥Space to start")
+            setState(symbol: "mic", status: "Mic off — hold Fn or double-press Fn")
         }
     }
 
@@ -655,9 +714,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    static func awaitValue(          // internal for DeadlineTests
-        of task: Task<String?, Never>?, deadline seconds: Double
-    ) async -> String? {
+    static func awaitValue<T: Sendable>(          // internal for DeadlineTests
+        of task: Task<T?, Never>?, deadline seconds: Double
+    ) async -> T? {
         guard let task else { return nil }
         let watchdog = Task {
             try await Task.sleep(for: .seconds(seconds))

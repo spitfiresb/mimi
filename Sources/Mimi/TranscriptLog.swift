@@ -6,11 +6,12 @@ import Foundation
 /// other two are written by later stages, and are `nil` until then.
 struct TranscriptEntry: Codable {
     /// Schema version. Bump when a field's meaning changes, not when one is added.
-    var v = 1
+    var v = 2
     var id = UUID()
     var at = Date()
 
-    /// Key press to key release, not time spent transcribing.
+    /// Key press to logging, including processing. Use audio.seconds for captured
+    /// audio duration and timings.releaseToPasteMs for release latency.
     var durationMs: Int
     var locale: String?
 
@@ -31,8 +32,8 @@ struct TranscriptEntry: Codable {
     /// Absent on entries logged before the Stage 5 default-engine swap.
     var engine: String?
 
-    /// Apple's transcript of the same audio, kept when Parakeet produced `raw`
-    /// — every dictation becomes a free A/B data point.
+    /// Apple's transcript if already finalized when Parakeet wins. Fast results
+    /// no longer wait for Apple solely to retain this diagnostic field.
     var appleRaw: String?
 
     /// Per-result recognition detail: confidence spans and the n-best
@@ -67,10 +68,16 @@ struct TranscriptEntry: Codable {
         var peak: Float?
         /// Seconds of audio actually captured.
         var seconds: Double?
+        /// Signal gate diagnostics. This is an energy check, not speech VAD.
+        var maxFrameRMS: Float?
+        var activeMs: Int?
+        var longestActiveMs: Int?
+        var silenceSkipped: Bool?
     }
 
     struct Timings: Codable {
-        /// finalizeAndFinishThroughEndOfInput + collecting results.
+        /// v2: additional time waiting for Apple fallback after Parakeet failed.
+        /// v1: waiting for Apple finalization before checking Parakeet.
         var finalizeMs: Int
         /// The Foundation Models pass (0 when skipped or verbatim).
         var formatMs: Int
@@ -78,7 +85,8 @@ struct TranscriptEntry: Codable {
         var settleMs: Int
         /// Waiting for modifiers to clear + posting ⌘V.
         var insertMs: Int
-        /// The Parakeet transcription of the buffered audio (0 = not run).
+        /// v2: time waiting for preferred transcription, concurrent with Apple.
+        /// v1: residual wait after Apple finalized, NOT full Parakeet runtime.
         var parakeetMs: Int?
         /// Keypress → session accepting audio (makeSession + context + start).
         var startupMs: Int?
@@ -87,6 +95,15 @@ struct TranscriptEntry: Codable {
         /// Worst gap between a word being spoken and the preview showing it,
         /// per the recognizer's own audio timestamps.
         var maxPreviewLagMs: Int?
+        /// Full Parakeet task runtime, including audio processing, not residual wait.
+        /// Nil when unavailable or still unfinished at the deadline.
+        var parakeetTotalMs: Int?
+        /// Full Apple finalization runtime when its result was available.
+        var appleFinalizeMs: Int?
+        /// Key release through posting paste; excludes clipboard restoration.
+        var releaseToPasteMs: Int?
+        /// Records the selected preference even if routing skips cleanup.
+        var cleanupEnabled: Bool?
     }
 
     /// What the text looked like after the user fixed it. The label.
@@ -94,7 +111,7 @@ struct TranscriptEntry: Codable {
 }
 
 /// One final result from the recognizer, with what it almost said instead.
-struct RecognitionResult: Codable {
+struct RecognitionResult: Codable, Sendable {
     /// The text it committed to.
     var text: String
     /// Runner-up transcriptions, best first.
@@ -103,7 +120,7 @@ struct RecognitionResult: Codable {
     /// (absent where the recognizer didn't attach one).
     var spans: [Span]
 
-    struct Span: Codable {
+    struct Span: Codable, Sendable {
         var t: String
         var c: Double?
     }

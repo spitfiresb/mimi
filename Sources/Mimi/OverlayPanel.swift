@@ -91,6 +91,15 @@ final class OverlayPanel {
 
     // MARK: - States
 
+    private var transcriptText = ""
+
+    func setLocked(_ locked: Bool) {
+        glyph.image = NSImage(
+            systemSymbolName: locked ? "lock.fill" : "waveform",
+            accessibilityDescription: locked ? "Hands-free" : "Listening"
+        )?.withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
+    }
+
     /// Monotonic token: a show() invalidates any in-flight hide, so a fade-out
     /// completing late can never orderOut a panel that was just re-shown.
     private var hideGeneration = 0
@@ -101,6 +110,14 @@ final class OverlayPanel {
         panel.alphaValue = 1
         panel.orderFrontRegardless()
         startPulse()
+    }
+
+    /// A new recording stays invisible until its ready callback reveals it.
+    func hideImmediately() {
+        hideGeneration += 1
+        stopPulse()
+        panel.orderOut(nil)
+        panel.alphaValue = 1
     }
 
     /// Committed text solidifies to full label color; the volatile tail stays
@@ -118,7 +135,8 @@ final class OverlayPanel {
     /// Everything dims while the final pass runs.
     func waiting() {
         stopPulse()
-        let current = label.attributedStringValue.string
+        setLocked(false)
+        let current = transcriptText
         // If no preview ever arrived, "Listening…" is still on screen — but the
         // recording is over, and a stall past this point would wedge the panel
         // on a state the app already left. Say what's actually happening.
@@ -166,6 +184,8 @@ final class OverlayPanel {
                 .font: Self.font, .foregroundColor: NSColor.tertiaryLabelColor,
             ]))
         }
+
+        transcriptText = text.string
 
         if animated {
             let fade = CATransition()

@@ -48,7 +48,7 @@ final class DeadlineTests: XCTestCase {
 
     /// No engine, no task — the caller falls straight through to Apple's text.
     func testNoTaskYieldsNil() async {
-        let result = await AppDelegate.awaitValue(of: nil, deadline: 1)
+        let result: String? = await AppDelegate.awaitValue(of: nil, deadline: 1)
         XCTAssertNil(result)
     }
 

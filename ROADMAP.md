@@ -129,6 +129,57 @@ user's sleep/wake check. In roughly five monitored minutes, capture was requeste
 for about 47 seconds (16% of the window). Neither this fraction nor the process
 CPU/RAM samples establish battery percentage, watt-hours, or all-day savings.
 
+### Speed follow-up
+
+- [x] Default cleanup to off for new installs while preserving explicit choices.
+- [x] Let a successful Parakeet result proceed without waiting for Apple
+      finalization or teardown. Keep Apple preview and a bounded parallel fallback;
+      retain its diagnostic transcript only if it is already available.
+- [x] Log full Parakeet runtime and total release-to-paste time. Transcript schema
+      v2 distinguishes preferred-result wait from additional fallback wait; v1
+      `parakeetMs` measured only the residual wait after Apple finalization.
+- [ ] Compare live release-to-paste timings with cleanup off, across short and
+      longer dictations, including fallback/error cases.
+- [ ] Streaming Parakeet remains a separate accuracy/energy-gated project in
+      [STREAMING.md](STREAMING.md); these changes do not re-export or retrain models.
+
+September 13 speed smoke test: 6.58, 10.87 and 23.35 seconds of recorded audio
+pasted 986, 440 and 1128 ms after release, respectively. All used Parakeet with
+cleanup off and no additional Apple wait. These are different utterances from
+the earlier baseline; multi-minute and live fallback comparisons remain open.
+
+### Silence handling
+
+- [x] Check captured signal before showing Transcribing or starting Parakeet /
+      Apple finalization. Empty recordings close without formatting or pasting.
+- [x] Reject low-level audio and short isolated transients using a model-free,
+      DC-corrected frame RMS gate; log gate diagnostics. 74 tests pass.
+- [ ] Verify silence and quiet short words on the user's microphone. The initial
+      threshold is grounded in recent silent-capture peaks; those logs do not
+      contain waveforms for replay or quiet-speech sensitivity measurements.
+- [ ] Consider speech VAD if louder non-speech noise still produces unwanted
+      text. Apple's SpeechDetector is an option, with accuracy/latency/energy
+      tradeoffs to measure before adopting it.
+
+### Fn shortcut and hands-free
+
+- [x] Hold Fn to dictate; double-press within 0.5 seconds to lock; press again to
+      finish. A first tap under 0.3 seconds cancels without transcription.
+- [x] Show hands-free state in the overlay and menu bar. Reset lock on sleep,
+      startup failure, event-tap interruption and the existing two-minute limit.
+- [x] Test gesture transitions, busy-app handling, synthetic-event filtering and
+      event-tap recovery without opening audio hardware.
+- [x] Ignore companion Globe key events (179) when recognizing Fn (63). These
+      were mistaken for another shortcut, cancelling holds or clearing the first
+      tap. Cover both event orders and a second tap during pending startup
+      (67 total tests pass).
+- [x] Verify physical Fn hold, double-press lock and next-press stop on the Mac
+      after granting Accessibility to the rebuilt app (user confirmed).
+- [x] Keep startup invisible and show the overlay only after microphone and
+      recognition are ready. Short first taps remain invisible, avoiding a
+      double-press flash. Hands-free uses only the lock icon, without instructions.
+      The localhost studio mirrors this simpler set of states.
+
 ---
 
 ## Act I — the system-framework MVP ✅

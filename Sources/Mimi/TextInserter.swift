@@ -28,8 +28,8 @@ enum TextInserter {
         pasteboard.setString(text, forType: .string)
         let ours = pasteboard.changeCount
 
-        // The user may still be holding ⌃⌥ from the hotkey. Physical modifiers
-        // merge with synthesized ones, which would turn our ⌘V into ⌃⌥⌘V.
+        // The Fn press that stops hands-free capture (or another modifier) may
+        // still be down. Let it clear before synthesizing an unmodified ⌘V.
         await waitForModifiersToClear()
         postPaste()
 
@@ -47,7 +47,7 @@ enum TextInserter {
     }
 
     private static func waitForModifiersToClear() async {
-        let interfering: CGEventFlags = [.maskControl, .maskAlternate, .maskCommand, .maskShift]
+        let interfering: CGEventFlags = [.maskControl, .maskAlternate, .maskCommand, .maskShift, .maskSecondaryFn]
         for _ in 0..<80 {  // ~800ms ceiling
             let flags = CGEventSource.flagsState(.combinedSessionState)
             if flags.intersection(interfering).isEmpty { return }

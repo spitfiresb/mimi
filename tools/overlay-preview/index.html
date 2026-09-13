@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mimi — Overlay studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Ctext y='32' font-size='34'%3E耳%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark">耳</span><strong>mimi</strong><span class="divider"></span><span>Overlay studio</span></div>
+    <div class="header-actions"><span class="local"><i></i> Local preview</span><button id="export">Export design <span aria-hidden="true">↗</span></button></div>
+  </header>
+  <main>
+    <aside class="states-pane">
+      <p class="eyebrow">THE EXPERIENCE</p>
+      <h1>Every little moment.</h1>
+      <p class="muted intro">Explore the overlay without starting a dictation.</p>
+      <nav id="states" aria-label="Overlay state"></nav>
+      <button id="play" class="play">▶ Play sequence</button>
+      <p class="side-note">Use ↑ and ↓ to step through states.<br>Space pauses playback.</p>
+    </aside>
+    <section class="workspace" aria-label="Preview workspace">
+      <div class="workspace-toolbar"><div><span class="eyebrow">PREVIEW</span><span id="state-name">Listening</span></div><label class="backdrop-picker">Backdrop <select id="backdrop"><option value="dusk">Dusk</option><option value="paper">Light workspace</option><option value="night">Dark workspace</option><option value="color">Color study</option></select></label></div>
+      <div class="stage dusk" id="stage">
+        <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+        <div class="sample-window" aria-hidden="true"><div class="window-bar"><span>● ● ●</span><span>Notes</span><span>↗</span></div><div class="sample-content"><div class="sample-date">TUESDAY, SEPTEMBER 15</div><h2>A little room to think.</h2><p>A quiet workspace. A cup of coffee.<br>Some thoughts worth getting down.</p><div class="sample-rule"></div><p class="sample-muted">Good tools leave room for the work.</p></div></div>
+        <div class="overlay-anchor"><div id="overlay" class="mimi-overlay"><span class="glyph" id="glyph" aria-hidden="true"></span><div class="overlay-copy"><span id="committed"></span><span id="volatile-text"></span></div></div></div>
+        <div class="stage-caption"><span id="dimensions"></span><span>Actual-size overlay · simulated background</span></div>
+      </div>
+      <div class="state-details"><span id="state-number">03 / 08</span><div><h2 id="detail-title">Listening</h2><p id="detail-description"></p></div><span id="mic-state" class="mic-state"></span></div>
+      <div class="preview-note"><span aria-hidden="true">◌</span><p>This is a browser design preview. macOS blur and text rendering will differ slightly. Export a design to carry it back to Mimi’s native overlay.</p></div>
+    </section>
+    <aside class="inspector" aria-label="Appearance editor">
+      <div class="inspector-heading"><span class="eyebrow">APPEARANCE</span><button id="reset" class="text-button">Reset</button></div>
+      <label class="field-label" for="preset">Starting point</label><select id="preset"><option value="current">Current Mimi · approximation</option><option value="glass">Soft glass</option><option value="ink">Solid ink</option><option value="light">Frosted light</option><option value="custom">Custom</option></select>
+      <section class="control-section"><h2>Surface</h2><label class="color-row">Background <input type="color" id="background" aria-label="Background color"></label><div id="surface-controls"></div><label class="color-row">Text <input type="color" id="textColor" aria-label="Text color"></label></section>
+      <section class="control-section"><h2>Shape & type</h2><div id="shape-controls"></div></section>
+      <section class="control-section"><h2>Content</h2><label class="field-label" for="sample">Sample dictation</label><textarea id="sample" rows="3" spellcheck="false"></textarea><label class="check-row"><input type="checkbox" id="motion"> Animate listening icon</label></section>
+      <p class="save-note" id="save-note" role="status">Changes stay in this browser.</p>
+    </aside>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
