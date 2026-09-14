@@ -13,6 +13,9 @@ let package = Package(
             // NSExceptions, which Swift cannot catch without an ObjC @try.
             dependencies: ["EvalKit", "ObjCShims"],
             path: "Sources/Mimi",
+            // Preserve the earlier experiment in the checkout, but do not
+            // compile or bundle any desktop capture code in the app.
+            exclude: ["DesktopGlassCapture.swift", "DesktopGlassView.swift", "GlassCaptureGeometry.swift", "Shaders"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .target(name: "ObjCShims", path: "Sources/ObjCShims"),
@@ -35,6 +38,7 @@ let package = Package(
             name: "MimiTests",
             dependencies: ["Mimi", "EvalKit"],
             path: "Tests/MimiTests",
+            exclude: ["DesktopGlassTests.swift"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

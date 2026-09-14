@@ -14,20 +14,21 @@ import AppKit
 final class OverlayPanel {
     private let panel: NonActivatingPanel
     private let glass: NSGlassEffectView
+    private let glassTuner: NativeGlassTuner?
     private let glyph: NSImageView
     private let label: NSTextField
 
-    private static let minWidth: CGFloat = 220
+    private static let minWidth: CGFloat = 350
+    private static let minHeight: CGFloat = 52
     private static let maxWidth: CGFloat = 460
     private static let hPad: CGFloat = 16
     private static let vPad: CGFloat = 12
     private static let glyphWidth: CGFloat = 18
     private static let glyphGap: CGFloat = 10
-    private static let cornerRadius: CGFloat = 22
     private static let bottomInset: CGFloat = 120
     private static let font = NSFont.systemFont(ofSize: 14, weight: .medium)
 
-    init() {
+    init(tunesGlass: Bool = true) {
         panel = NonActivatingPanel(
             contentRect: NSRect(x: 0, y: 0, width: Self.minWidth, height: 44),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -43,16 +44,17 @@ final class OverlayPanel {
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
         panel.collectionBehavior = [
-            .canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle,
+            .canJoinAllSpaces, .canJoinAllApplications, .stationary,
+            .fullScreenAuxiliary, .ignoresCycle,
         ]
-        // Follow the system appearance and leave the clear material untinted.
-        // A dark tint made the small overlay read as a flat, opaque slab.
-        // Native glass owns its blur/refraction; it has no magnification knob.
         panel.appearance = nil
-        glass = NSGlassEffectView()
+        // Let macOS composite the live backdrop without capturing screen pixels.
+        // Keep the clear material untinted so moving windows remain visible.
+        glass = NSGlassEffectView(frame: .zero)
         glass.style = .clear
-        glass.cornerRadius = Self.cornerRadius
+        glass.cornerRadius = 22
         glass.tintColor = nil
+        glassTuner = tunesGlass ? NativeGlassTuner(view: glass) : nil
 
         glyph = NSImageView()
         glyph.imageScaling = .scaleProportionallyUpOrDown
@@ -72,9 +74,7 @@ final class OverlayPanel {
         label.lineBreakMode = .byWordWrapping
         label.wantsLayer = true
 
-        // Put sharp, non-vibrant text in the glass's supported content slot.
-        // The system handles live backdrop refraction and the specular rim;
-        // the transcript itself must not be distorted or vibrancy-blended.
+        // Use the supported content slot so the transcript stays above the glass.
         let content = NonVibrantView()
         content.autoresizingMask = [.width, .height]
         content.addSubview(glyph)
@@ -103,6 +103,7 @@ final class OverlayPanel {
         render(committed: "", volatile: message, animated: false)
         panel.alphaValue = 1
         panel.orderFrontRegardless()
+        glassTuner?.start()
         startPulse()
     }
 
@@ -111,6 +112,7 @@ final class OverlayPanel {
         hideGeneration += 1
         stopPulse()
         panel.orderOut(nil)
+        glassTuner?.stop()
         panel.alphaValue = 1
     }
 
@@ -160,6 +162,7 @@ final class OverlayPanel {
             MainActor.assumeIsolated {
                 guard generation == self.hideGeneration else { return }
                 self.panel.orderOut(nil)
+                self.glassTuner?.stop()
                 self.panel.alphaValue = 1
             }
         }
@@ -169,13 +172,19 @@ final class OverlayPanel {
 
     private func render(committed: String, volatile: String, animated: Bool) {
         let text = NSMutableAttributedString()
+        // Local shadow supports white type over clear glass without tinting
+        // or blurring the desktop underneath the entire pill.
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.85)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
         text.append(NSAttributedString(string: committed, attributes: [
-            .font: Self.font, .foregroundColor: NSColor.white,
+            .font: Self.font, .foregroundColor: NSColor.white, .shadow: shadow,
         ]))
         if !volatile.isEmpty {
             let joined = committed.isEmpty || committed.hasSuffix(" ") ? volatile : " " + volatile
             text.append(NSAttributedString(string: joined, attributes: [
-                .font: Self.font, .foregroundColor: NSColor.white.withAlphaComponent(0.62),
+                .font: Self.font, .foregroundColor: NSColor.white.withAlphaComponent(0.72), .shadow: shadow,
             ]))
         }
 
@@ -196,19 +205,23 @@ final class OverlayPanel {
     private func layout(for text: NSAttributedString) {
         let textLeft = Self.hPad + Self.glyphWidth + Self.glyphGap
         let maxTextWidth = Self.maxWidth - textLeft - Self.hPad
+        // NSTextField's cell reserves horizontal space around the glyphs.
+        // Measuring glyphs alone can wrap the final word onto a clipped line.
+        let textInsets: CGFloat = 4
 
         let bounds = text.boundingRect(
-            with: NSSize(width: maxTextWidth, height: .greatestFiniteMagnitude),
+            with: NSSize(width: maxTextWidth - textInsets, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading]
         )
         let lineHeight = ceil(NSLayoutManager().defaultLineHeight(for: Self.font))
         // Uncapped height, but never past the visible screen.
         let maxTextHeight = (NSScreen.main?.visibleFrame.height ?? 800) - Self.bottomInset - 40
         let textHeight = min(ceil(bounds.height), maxTextHeight)
-        let textWidth = min(ceil(bounds.width), maxTextWidth)
+        let textWidth = min(ceil(bounds.width) + textInsets, maxTextWidth)
 
         let width = max(Self.minWidth, textLeft + textWidth + Self.hPad)
-        let height = textHeight + 2 * Self.vPad
+        let height = max(Self.minHeight, textHeight + 2 * Self.vPad)
+        let textBottom = (height - textHeight) / 2
 
         guard let screen = NSScreen.main else { return }
         let visible = screen.visibleFrame
@@ -219,10 +232,10 @@ final class OverlayPanel {
             height: height
         )
 
-        label.frame = NSRect(x: textLeft, y: Self.vPad, width: textWidth, height: textHeight)
+        label.frame = NSRect(x: textLeft, y: textBottom, width: textWidth, height: textHeight)
         glyph.frame = NSRect(
             x: Self.hPad,
-            y: height - Self.vPad - lineHeight + (lineHeight - 14) / 2,
+            y: height - textBottom - lineHeight + (lineHeight - 14) / 2,
             width: Self.glyphWidth,
             height: 14
         )

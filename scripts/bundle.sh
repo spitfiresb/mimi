@@ -44,10 +44,12 @@ codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
 # granted but the tap never installs, and Microphone still *reports* authorized
 # while coreaudiod silently delivers zero audio buffers — dictations record
 # 0.0s with no error anywhere (2026-08-11). Clear both so each grant starts
-# fresh and re-prompts. Set RESET_TCC=0 to skip.
+# fresh and re-prompts. Per the user's standing instruction, always reset
+# Accessibility when replacing/relaunching Mimi. RESET_TCC=0 only preserves
+# the Microphone grant.
+tccutil reset Accessibility "$BUNDLE_ID" >/dev/null
+echo "reset Accessibility approval for $BUNDLE_ID"
 if [ "${RESET_TCC:-1}" = "1" ]; then
-	tccutil reset Accessibility "$BUNDLE_ID" >/dev/null 2>&1 \
-		&& echo "reset Accessibility approval for $BUNDLE_ID"
 	tccutil reset Microphone "$BUNDLE_ID" >/dev/null 2>&1 \
 		&& echo "reset Microphone approval for $BUNDLE_ID"
 fi
@@ -75,10 +77,9 @@ if [ "$WAS_RUNNING" = "1" ] && [ "${RELAUNCH:-1}" = "1" ]; then
 fi
 
 echo
+echo "Next: System Settings > Privacy & Security > Accessibility and switch Mimi on."
 if [ "${RESET_TCC:-1}" = "1" ]; then
-	echo "Next: System Settings > Privacy & Security > Accessibility and switch Mimi on."
-	echo "      Permission resets were requested above; macOS may also prompt for Microphone."
+	echo "macOS may also prompt for Microphone."
 else
-	echo "Existing permissions were left unchanged."
-	echo "If Mimi requests access, enable it in System Settings > Privacy & Security."
+	echo "The existing Microphone grant was preserved."
 fi

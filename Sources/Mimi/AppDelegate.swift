@@ -78,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var context: RecordingContext?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Self.log.notice("Overlay renderer: native lens v2 (live backdrop); screen-capture renderer excluded from this build")
         UserDefaults.standard.register(defaults: [Self.verbatimKey: true])
         buildMenuBarItem()
         enableLaunchAtLoginOnFirstRun()

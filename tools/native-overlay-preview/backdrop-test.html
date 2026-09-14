@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mimi — cross-app backdrop test</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 18px ui-monospace, monospace; color: #071626; }
+  header { position: fixed; top: 0; left: 0; right: 0; z-index: 1; background: #fff; padding: 12px 20px; box-shadow: 0 2px 8px #0003; }
+  header small { display: block; margin-top: 4px; font: 14px system-ui; }
+  main { display: grid; grid-template-columns: repeat(auto-fill, minmax(48px, 1fr)); }
+  span { height: 25px; text-align: center; line-height: 25px; background: #94d4fc; }
+  span:nth-child(2n) { background: #ffc78b; }
+  span:nth-child(7n) { background: #efff87; }
+</style>
+<header>Chrome backdrop test — keep the Mimi pill visible
+  <small>The numbered tiles are rendered by Chrome. Scroll: numbers beneath the pill should stay visible and move through the lens.</small>
+</header>
+<main id="grid"></main>
+<script>
+  const grid = document.getElementById('grid');
+  const cells = document.createDocumentFragment();
+  for (let n = 0; n < 8000; n++) {
+    const cell = document.createElement('span');
+    cell.textContent = String(n % 1000).padStart(3, '0');
+    cells.append(cell);
+  }
+  grid.append(cells);
+</script>
