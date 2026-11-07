@@ -45,6 +45,16 @@ Mimi's menu if you want the optional language-model pass; existing saved choices
 are preserved. A successful Parakeet result pastes without waiting for Apple's
 final transcript. Apple still provides live preview and fallback recognition.
 
+## Brand
+
+Mimi's brand mark is a bunny cut out of an ink circle. Masters live in
+`Resources/Brand/` (`mimi-logo.svg`, `mimi-mark-mono.svg` for one-colour use,
+`mimi-app-icon.svg` on the macOS 1024 grid). `scripts/make-icon.sh` regenerates
+the checked-in `Resources/AppIcon.icns` from the icon master (needs Google
+Chrome to rasterize). The menu bar draws the same mark as a vector template
+image (`MimiMark.swift`) while Mimi is at rest; listening, hands-free and error
+states keep their SF Symbols.
+
 ## Overlay appearance
 
 The overlay is stock macOS 26 Liquid Glass: an `NSGlassEffectView` in the

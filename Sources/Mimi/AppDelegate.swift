@@ -763,8 +763,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - UI
 
+    /// The bunny mark stands for Mimi at rest ("mic": ready, starting,
+    /// transcribing). Listening, hands-free and error states keep their SF
+    /// Symbols so the menu bar still shows at a glance what the mic is doing.
     private func setState(symbol: String, status: String) {
-        statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Mimi")
+        statusItem.button?.image = symbol == "mic"
+            ? MimiMark.menuBarImage
+            : NSImage(systemSymbolName: symbol, accessibilityDescription: "Mimi")
         statusItem.button?.toolTip = "Mimi — \(status)"
         statusItem.menu?.item(at: 0)?.title = status
     }
