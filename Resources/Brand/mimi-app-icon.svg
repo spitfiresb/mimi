@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- macOS app icon master: 824-pt squircle on the 1024 grid, the brand mark's bunny inside. Regenerate AppIcon.icns with scripts/make-icon.sh. -->
+  <defs>
+    <clipPath id="sq"><rect x="0" y="0" width="200" height="200" rx="45"/></clipPath>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="2.5" stdDeviation="3" flood-color="#000" flood-opacity=".28"/>
+    </filter>
+  </defs>
+  <g transform="translate(100 100) scale(4.12)">
+    <rect x="0" y="0" width="200" height="200" rx="45" fill="#141416" filter="url(#shadow)"/>
+    <g clip-path="url(#sq)">
+      <rect width="200" height="200" fill="#141416"/>
+      <g transform="translate(100 104) scale(.86) translate(-100 -100)">
+        <ellipse cx="80" cy="48" rx="13" ry="32" transform="rotate(-12 80 48)" fill="#fff"/>
+    <ellipse cx="122" cy="48" rx="13" ry="32" transform="rotate(24 122 48)" fill="#fff"/>
+    <ellipse cx="100" cy="100" rx="48" ry="40" fill="#fff"/>
+    <path d="M 70 126 C 66 150 64 176 66 204 L 134 204 C 136 176 134 150 130 126 Z" fill="#fff"/>
+    <circle cx="141" cy="182" r="11" fill="#fff"/>
+    <ellipse cx="84" cy="100" rx="6" ry="8" fill="#141416"/>
+    <ellipse cx="116" cy="100" rx="6" ry="8" fill="#141416"/>
+      </g>
+    </g>
+    <rect x=".75" y=".75" width="198.5" height="198.5" rx="44.5" fill="none" stroke="#fff" stroke-opacity=".2" stroke-width="1.5"/>
+  </g>
+</svg>

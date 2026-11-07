@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <!-- One-colour mark (menu bar, favicons, embossing): circle with the bunny as a transparent hole, eyes kept. Uses currentColor. -->
+  <defs>
+    <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="200" height="210">
+      <rect x="0" y="0" width="200" height="210" fill="#fff"/>
+      <g fill="#000">
+        <ellipse cx="80" cy="48" rx="13" ry="32" transform="rotate(-12 80 48)"/>
+        <ellipse cx="122" cy="48" rx="13" ry="32" transform="rotate(24 122 48)"/>
+        <ellipse cx="100" cy="100" rx="48" ry="40"/>
+        <path d="M 70 126 C 66 150 64 176 66 204 L 134 204 C 136 176 134 150 130 126 Z"/>
+        <circle cx="141" cy="182" r="11"/>
+      </g>
+    </mask>
+  </defs>
+  <circle cx="100" cy="100" r="96" fill="currentColor" mask="url(#m)"/>
+  <ellipse cx="84" cy="100" rx="7" ry="9" fill="currentColor"/>
+  <ellipse cx="116" cy="100" rx="7" ry="9" fill="currentColor"/>
+</svg>

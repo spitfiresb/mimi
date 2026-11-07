@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <!-- Mimi brand mark: the bunny cut out of an ink circle. -->
+  <defs><clipPath id="c"><circle cx="100" cy="100" r="96"/></clipPath></defs>
+  <circle cx="100" cy="100" r="96" fill="#141416"/>
+  <g clip-path="url(#c)">
+    <ellipse cx="80" cy="48" rx="13" ry="32" transform="rotate(-12 80 48)" fill="#fff"/>
+    <ellipse cx="122" cy="48" rx="13" ry="32" transform="rotate(24 122 48)" fill="#fff"/>
+    <ellipse cx="100" cy="100" rx="48" ry="40" fill="#fff"/>
+    <path d="M 70 126 C 66 150 64 176 66 204 L 134 204 C 136 176 134 150 130 126 Z" fill="#fff"/>
+    <circle cx="141" cy="182" r="11" fill="#fff"/>
+    <ellipse cx="84" cy="100" rx="6" ry="8" fill="#141416"/>
+    <ellipse cx="116" cy="100" rx="6" ry="8" fill="#141416"/>
+  </g>
+</svg>
