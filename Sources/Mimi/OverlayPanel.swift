@@ -13,8 +13,7 @@ import AppKit
 @MainActor
 final class OverlayPanel {
     private let panel: NonActivatingPanel
-    private let glass: NSGlassEffectView
-    private let glassTuner: NativeGlassTuner?
+    private let glass: LiveGlassView
     private let glyph: NSImageView
     private let label: NSTextField
 
@@ -28,7 +27,7 @@ final class OverlayPanel {
     private static let bottomInset: CGFloat = 120
     private static let font = NSFont.systemFont(ofSize: 14, weight: .medium)
 
-    init(tunesGlass: Bool = true) {
+    init() {
         panel = NonActivatingPanel(
             contentRect: NSRect(x: 0, y: 0, width: Self.minWidth, height: 44),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -48,17 +47,16 @@ final class OverlayPanel {
             .fullScreenAuxiliary, .ignoresCycle,
         ]
         panel.appearance = nil
-        // Let macOS composite the live backdrop without capturing screen pixels.
-        // Keep the clear material untinted so moving windows remain visible.
-        glass = NSGlassEffectView(frame: .zero)
-        glass.style = .clear
+        // Stock regular Liquid Glass — the same material as Notification Center
+        // pills. WindowServer composites and blurs the live backdrop; no private
+        // filter tuning and no screen capture.
+        glass = LiveGlassView(frame: .zero)
+        glass.style = .regular
         glass.cornerRadius = 22
-        glass.tintColor = nil
-        glassTuner = tunesGlass ? NativeGlassTuner(view: glass) : nil
 
         glyph = NSImageView()
         glyph.imageScaling = .scaleProportionallyUpOrDown
-        glyph.contentTintColor = NSColor.white.withAlphaComponent(0.72)
+        glyph.contentTintColor = .secondaryLabelColor
         glyph.image = NSImage(
             systemSymbolName: "waveform",
             accessibilityDescription: "Listening"
@@ -74,8 +72,9 @@ final class OverlayPanel {
         label.lineBreakMode = .byWordWrapping
         label.wantsLayer = true
 
-        // Use the supported content slot so the transcript stays above the glass.
-        let content = NonVibrantView()
+        // The supported content slot keeps the transcript above the glass and
+        // lets label colors adapt to the backdrop, as system glass text does.
+        let content = NSView()
         content.autoresizingMask = [.width, .height]
         content.addSubview(glyph)
         content.addSubview(label)
@@ -103,7 +102,7 @@ final class OverlayPanel {
         render(committed: "", volatile: message, animated: false)
         panel.alphaValue = 1
         panel.orderFrontRegardless()
-        glassTuner?.start()
+        glass.setLive(true)
         startPulse()
     }
 
@@ -112,7 +111,7 @@ final class OverlayPanel {
         hideGeneration += 1
         stopPulse()
         panel.orderOut(nil)
-        glassTuner?.stop()
+        glass.setLive(false)
         panel.alphaValue = 1
     }
 
@@ -162,7 +161,7 @@ final class OverlayPanel {
             MainActor.assumeIsolated {
                 guard generation == self.hideGeneration else { return }
                 self.panel.orderOut(nil)
-                self.glassTuner?.stop()
+                self.glass.setLive(false)
                 self.panel.alphaValue = 1
             }
         }
@@ -172,19 +171,13 @@ final class OverlayPanel {
 
     private func render(committed: String, volatile: String, animated: Bool) {
         let text = NSMutableAttributedString()
-        // Local shadow supports white type over clear glass without tinting
-        // or blurring the desktop underneath the entire pill.
-        let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.85)
-        shadow.shadowBlurRadius = 2
-        shadow.shadowOffset = NSSize(width: 0, height: -1)
         text.append(NSAttributedString(string: committed, attributes: [
-            .font: Self.font, .foregroundColor: NSColor.white, .shadow: shadow,
+            .font: Self.font, .foregroundColor: NSColor.labelColor,
         ]))
         if !volatile.isEmpty {
             let joined = committed.isEmpty || committed.hasSuffix(" ") ? volatile : " " + volatile
             text.append(NSAttributedString(string: joined, attributes: [
-                .font: Self.font, .foregroundColor: NSColor.white.withAlphaComponent(0.72), .shadow: shadow,
+                .font: Self.font, .foregroundColor: NSColor.secondaryLabelColor,
             ]))
         }
 
@@ -270,8 +263,102 @@ final class OverlayPanel {
     }
 }
 
-private final class NonVibrantView: NSView {
-    override var allowsVibrancy: Bool { false }
+/// Stock glass in Mimi's panel samples a snapshot of whatever was behind it,
+/// so windows dragged underneath never show through. Two undocumented
+/// switches keep it live, as system glass is: the backdrop layer reads other
+/// apps' windows through WindowServer (`windowServerAware`), and the window
+/// never flattens its layer tree into a stale copy.
+///
+/// AppKit turns `windowServerAware` back off on nearly every layout, and
+/// replaces the backdrop layer (with the switch off) when the glass resizes.
+/// Fixing that up afterwards on a timer let the backdrop flip between modes
+/// between frames, which read as a stutter. Instead, while visible:
+/// - a main run-loop observer runs just before Core Animation commits each
+///   frame and switches on any new or reset backdrop layer, and
+/// - each backdrop layer is observed with KVO, so a reset made during the
+///   commit itself is reverted synchronously, in the same transaction.
+/// Either way a frame never renders with the switch off.
+///
+/// Selectors are checked first; a macOS without them falls back to stock glass.
+/// Set `MIMI_GLASS_DEBUG=1` to log each correction.
+/// https://oskargroth.com/blog/reverse-engineering-nsvisualeffectview
+final class LiveGlassView: NSGlassEffectView {
+    private static let key = "windowServerAware"
+    private static let debug = ProcessInfo.processInfo.environment["MIMI_GLASS_DEBUG"] != nil
+    /// Held strongly so no observed layer can deallocate while registered.
+    private var observed: [CALayer] = []
+
+    private var beforeCommit: CFRunLoopObserver?
+
+    override func layout() {
+        super.layout()
+        keepBackdropLive()
+    }
+
+    deinit {
+        if let beforeCommit { CFRunLoopRemoveObserver(CFRunLoopGetMain(), beforeCommit, .commonModes) }
+        for layer in observed { layer.removeObserver(self, forKeyPath: Self.key) }
+    }
+
+    /// Call on show and hide; nothing runs while the panel is hidden.
+    func setLive(_ live: Bool) {
+        if let beforeCommit {
+            CFRunLoopRemoveObserver(CFRunLoopGetMain(), beforeCommit, .commonModes)
+            self.beforeCommit = nil
+        }
+        guard live else { return }
+        keepBackdropLive()
+        // Core Animation commits in a before-waiting observer at order 2000000;
+        // running just ahead of it covers every frame's layer changes.
+        let observer = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.beforeWaiting.rawValue, true, 2_000_000 - 1) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.keepBackdropLive() }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+        beforeCommit = observer
+    }
+
+    func keepBackdropLive() {
+        if let window, window.responds(to: NSSelectorFromString("_setShouldAutoFlattenLayerTree:")),
+           (window.value(forKey: "shouldAutoFlattenLayerTree") as? Bool) != false {
+            Self.note("flatten")
+            window.setValue(false, forKey: "shouldAutoFlattenLayerTree")
+        }
+        var backdrops: [CALayer] = []
+        func walk(_ layer: CALayer) {
+            if layer.responds(to: NSSelectorFromString("setWindowServerAware:")) { backdrops.append(layer) }
+            layer.sublayers?.forEach(walk)
+        }
+        layer.map(walk)
+        // AppKit can replace the glass layers on resize; follow the live ones.
+        for old in observed where !backdrops.contains(where: { $0 === old }) {
+            old.removeObserver(self, forKeyPath: Self.key)
+        }
+        for new in backdrops where !observed.contains(where: { $0 === new }) {
+            new.addObserver(self, forKeyPath: Self.key, options: [.new], context: nil)
+        }
+        observed = backdrops
+        backdrops.forEach(Self.enforce)
+    }
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
+                               change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
+        guard keyPath == Self.key, let layer = object as? CALayer else {
+            super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+            return
+        }
+        Self.enforce(layer)
+    }
+
+    private static func enforce(_ layer: CALayer) {
+        guard (layer.value(forKey: key) as? Bool) != true else { return }
+        note(key)
+        layer.setValue(true, forKey: key)
+    }
+
+    private static func note(_ what: String) {
+        guard debug else { return }
+        FileHandle.standardError.write("glass: re-enabled \(what) at \(CACurrentMediaTime())\n".data(using: .utf8)!)
+    }
 }
 
 private final class NonActivatingPanel: NSPanel {

@@ -1,7 +1,7 @@
 # Overlay studio
 
 This browser studio retains the earlier frosted HUD approximation and does not
-render the native app's clear Liquid Glass. For the actual native overlay, run
+render the native app's Liquid Glass. For the actual native overlay, run
 `bash scripts/preview-native-glass.sh` from the repository root.
 
 Run from the repository root:
