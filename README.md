@@ -47,67 +47,41 @@ final transcript. Apple still provides live preview and fallback recognition.
 
 ## Overlay appearance
 
-The overlay uses macOS 26's native `NSGlassEffectView`, with the clear lens
-profile from the native experiment. `NativeGlassTuner` applies the filter inputs
-through Core Animation's named key paths and verifies presentation values.
-While visible, it disables automatic window-layer flattening and enables the
-backdrop layer's `windowServerAware` setting to address the reported frozen
-background. These private compositing settings are restored when hidden.
-The panel starts at the reviewed 350×52 size and grows with the transcript;
-text remains sharp above the lens with a small shadow for contrast.
+The overlay is stock macOS 26 Liquid Glass: an `NSGlassEffectView` in the
+`.regular` style, the same material as Notification Center's pills. WindowServer
+blurs and composites the live backdrop, so **Screen Recording is not required**
+and Mimi never receives screen pixels. Text uses system label colors, which
+adapt to light and dark backdrops, and Reduce Transparency is honored by the
+system.
 
-**Screen Recording is not required.** The earlier ScreenCaptureKit renderer,
-its geometry helpers, and its Metal shader are excluded from the Mimi target
-and app bundle. No screen-access prompt or screen-access menu item is present.
-The operating system composites the backdrop; Mimi does not receive its pixels.
+Stock glass in Mimi's panel freezes on a snapshot of what was behind it, so
+windows dragged underneath never show through. `LiveGlassView` keeps two
+undocumented switches on: the backdrop layer's `windowServerAware` (sample
+other apps' windows through WindowServer) and the window's flattening off
+(`shouldAutoFlattenLayerTree`). AppKit turns `windowServerAware` off during
+layout and replaces the backdrop layer on resize; correcting it afterwards on a
+timer made the backdrop stutter. While the pill is visible, a main run-loop
+observer just ahead of Core Animation's commit switches on any new or reset
+backdrop layer, and KVO reverts resets made during the commit itself, so no
+frame renders with it off. Selectors are checked first, so a macOS
+without them falls back to stock glass. Set `MIMI_GLASS_DEBUG=1` to log each
+correction.
 
-The lens inputs are private macOS APIs. Unsupported filter layouts retain the
-native material, and Objective-C exceptions are caught so tuning failures do
-not break dictation. Reduce Transparency restores the native accessibility
-appearance. Tuning polls only while the overlay is visible and stops on hide.
-Automated tests check presentation updates, idle compositing settings, recovery
-after settings are overwritten, resize, and cleanup. Live refraction while
-scrolling during dictation was visually confirmed on macOS 26.3; behavior during
-Space swipes still requires separate validation.
-
-The nonactivating panel joins all Spaces and applications, including eligible
-full-screen Spaces, and uses stationary window behavior for Mission Control.
-Its position stays anchored at the bottom center as the text grows.
+The panel starts at 350×52 and grows with the transcript, anchored at the
+bottom center. It never becomes key, joins all Spaces and applications
+(including eligible full-screen Spaces), and stays put in Mission Control.
 
 ### Native glass preview
 
-Run `bash scripts/preview-native-glass.sh` to launch **Mimi Glass Preview**.
-It uses the same `OverlayPanel.swift` as the app, but builds separately without
-screen capture, microphone, speech models, or hotkeys. The pill remains visible
-so you can switch apps, swipe between Spaces, and enter Mission Control. Use
-**Glass Preview** in the menu bar to show short or long text, hide it, or quit.
-The preview opens the floating **Clear lens preview** over your normal windows.
-Run with `--grid` to restore the 350×52, text-free reference comparison, or
-`--live-grid` to start its background moving after three seconds. The left
-outline is plain transparency; the right is the experimental native lens.
-**Hide Grid (Keep Lens Unchanged)** removes the test background without changing
-lens geometry, filter parameters, position, or text visibility. **Show / Hide
-Text (Keep Lens Size)** isolates foreground visibility without resizing.
-
-**Deep Lens Test** adjusts undocumented native filter inputs with blur and tint
-removed. The reference has an inner-refraction height of 26 and amount of 15.6.
-**Previous Edge Lens** retains Apple's refraction geometry with blur cleared;
-**Original Native Glass** restores the unmodified material. The prototype comparison controls remain available for visual evaluation; the
-reviewed lens profile is also integrated into the dictation app.
-
-The preview compares model and presentation filter values while its background
-changes. Earlier filter-object replacement could leave presentation values at
-the opaque defaults despite the requested model values. Updates now use named
-filter key paths on the layer inside a transaction with implicit animations
-disabled, followed by a flush when values change. Matching values verify filter
-propagation; they do not by themselves prove the desired optical appearance.
-See [the native preview guide](tools/native-overlay-preview/README.md).
-This does not rebuild or restart the running dictation app.
-
-The previous custom Metal experiment remains in `DesktopGlassView.swift`,
-`DesktopGlassCapture.swift`, and `Shaders/DesktopGlass.metal` for comparison,
-but those files are excluded from the app build, along with their old tests. Its upstream attribution is in
-[ThirdParty/KKarsyline-LiquidGlass/SOURCE.md](ThirdParty/KKarsyline-LiquidGlass/SOURCE.md).
+Run `bash scripts/preview-native-glass.sh` to launch **Mimi Glass Preview**, which
+builds the same `OverlayPanel.swift` as the app without the microphone, speech
+models, or hotkeys. Use **Glass Preview** in the menu bar to show the listening
+state, short or long text, or **Play Dictation** (the full listening → partials →
+transcribing → settle → hide sequence). Launch flags: `--listening`, `--long`,
+`--play`. This does not rebuild or restart the running dictation app.
+To check the backdrop stays live, run a second copy as the background:
+`"build/Mimi Glass Preview.app/Contents/MacOS/MimiGlassPreview" --moving-window --bg-only &`
+then the preview; `--dump` prints the backdrop layer's state.
 
 ### Legacy browser studio
 
@@ -115,5 +89,5 @@ Run `python3 tools/overlay-preview/serve.py`, then open
 [localhost:8769](http://localhost:8769) to explore every overlay state and edit
 its appearance live. No Swift build, microphone, or speech models are needed.
 Browser settings save locally and can be exported as a design JSON file.
-The browser retains the earlier frosted-glass approximation; designs are applied to native Mimi
+The browser retains an earlier frosted-glass approximation; designs are applied to native Mimi
 separately. See [the preview guide](tools/overlay-preview/README.md).

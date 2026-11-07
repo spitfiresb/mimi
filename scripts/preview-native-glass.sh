@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# Build the production overlay in an isolated app with no capture dependencies.
+# Build the production overlay in an isolated app: no microphone, speech, or hotkeys.
+# Args: --listening | --long | --play (default: short text).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PREVIEW_APP="build/Mimi Glass Preview.app"
 mkdir -p "$PREVIEW_APP/Contents/MacOS"
-xcrun clang -fobjc-arc -c Sources/ObjCShims/MMExceptionCatcher.m -o build/GlassPreviewExceptions.o
-xcrun swiftc -swift-version 5 -D GLASS_PREVIEW \
-    -import-objc-header Sources/ObjCShims/include/MMExceptionCatcher.h \
-    Sources/Mimi/OverlayPanel.swift Sources/Mimi/NativeGlassTuner.swift \
+xcrun swiftc -swift-version 5 \
+    Sources/Mimi/OverlayPanel.swift \
     tools/native-overlay-preview/main.swift \
-    build/GlassPreviewExceptions.o \
     -o "$PREVIEW_APP/Contents/MacOS/MimiGlassPreview"
 cat > "$PREVIEW_APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
